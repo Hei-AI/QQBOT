@@ -1,0 +1,166 @@
+server:
+  # Go HTTP 服务端口；管理台和 API 都从这个端口访问。
+  port: 8000
+
+  # 数据库连接地址。当前 Go 版实际使用本地 SQLite 文件 data/QqBot-store.sqlite。
+  databaseUrl: ""
+
+  bot:
+    # 机器人自己的 QQ 号，用于过滤自己发出的消息，也会写入主系统提示词。
+    qq: ""
+    creator:
+      # 创造者名称，会出现在主系统提示词身份信息中。
+      name: "创造者"
+      # 创造者 QQ，会出现在主系统提示词身份信息中。
+      qq: ""
+
+  napcat:
+    # NapCat WebSocket 地址；需要和 NapCat 端实际监听地址一致。
+    wsUrl: "ws://127.0.0.1:3001/ws"
+    # NapCat 断线后的重连间隔，单位毫秒。
+    reconnectMs: 5000
+    # 调用 NapCat API 的单次请求超时时间，单位毫秒。
+    requestTimeoutMs: 30000
+    # 允许机器人监听的 QQ 群。
+    listenGroupIds:
+      - ""
+    # 首次进入某个群聊/私聊状态时，最多补入多少条最近消息作为上下文。
+    startupContextRecentMessageCount: 40
+
+  agent:
+    # 根 Agent 上下文压缩阈值，按估算 token 数判断；越大越少压缩，越小越容易丢旧上下文。
+    contextCompactionTotalTokenThreshold: 150000
+    # LLM 调用失败后的重试等待时间，单位毫秒。
+    llmRetryBackoffMs: 30000
+    # wait 工具声明的最大等待时间，单位毫秒；代码中会限制实际等待，避免长时间卡住回复。
+    waitToolMaxWaitMs: 600000
+    # 跨状态通知聚合窗口，单位毫秒；用于类似群聊/私聊/新闻事件的批量提醒节奏。
+    notificationBatchWindowMs: 30000
+
+    story:
+      # Story Agent 单批最多处理多少条消息。
+      batchSize: 24
+      # Story Agent 空闲多久后自动 flush 一批消息，单位毫秒。
+      idleFlushMs: 120000
+      memory:
+        embedding:
+          # Story 记忆向量化供应商。google 表示调用 Gemini Embeddings API。
+          provider: google
+          # Gemini API key。
+          apiKey: ""
+          # Gemini API 根地址；代码会自动拼接 /v1beta/models/{model}:embedContent。
+          baseUrl: https://generativelanguage.googleapis.com
+          # Gemini embedding 模型。gemini-embedding-2 使用文本前缀表达检索任务，不再发送 taskType 字段。
+          model: gemini-embedding-2
+          # embedding 输出维度；用于缓存 key 和 Story 文档过滤，需要和 API 返回一致。
+          outputDimensionality: 768
+      recall:
+        # search_memory 工具最多返回多少条 Story。
+        topK: 2
+        # Story 召回最低相似度；越高越严格，越低越容易召回弱相关记忆。
+        scoreThreshold: 0.65
+
+    terminal:
+      # bash 工具单条命令超时时间，单位毫秒。
+      commandTimeoutMs: 30000
+      # bash 工具返回给模型的输出预览字节数。
+      previewBytes: 2048
+      # 单次命令最多保存 stdout/stderr 多少字节。
+      maxOutputBytes: 1048576
+      # 单条命令最大长度，防止模型生成过长命令。
+      maxCommandLength: 4096
+      # read_bash_output 工具读取历史输出时最多返回多少字节。
+      readOutputMaxSize: 4096
+      # 命令执行 shell。Windows 下代码会自动把 /bin/sh 兜底为 PowerShell。
+      shell: /bin/sh
+
+  news:
+    ithome:
+      # IT 之家 RSS 轮询间隔，单位毫秒；设置为 0 可关闭“你已进入 IT 之家 资讯空间”相关事件。
+      pollIntervalMs: 0
+      # 每次轮询最多读取 RSS 前多少篇文章。
+      recentArticleLimit: 8
+      # 打开单篇文章时最多保留多少字符正文。
+      articleMaxChars: 8000
+  llm:
+    # 单次 LLM 请求超时时间，单位毫秒。
+    timeoutMs: 45000
+    # 是否在日志中打印模型返回的 reasoning/thinking 摘要；默认 false，排障时可临时打开。
+    debugReasoning: true
+    providers:
+      deepseek:
+        # DeepSeek API key；为空时不能使用 deepseek provider。
+        apiKey: ""
+        # DeepSeek OpenAI-compatible API 地址。
+        baseUrl: https://api.deepseek.com
+        # 允许在配置 usage 中选择的 DeepSeek 模型白名单。
+        models:
+          - deepseek-v4-pro
+      openai:
+        # OpenAI provider 的 key。这里指向本地 bridge 时可使用占位值。
+        apiKey: ""
+        # OpenAI-compatible Chat Completions bridge 根地址；代码会自动拼接 /chat/completions。
+        # 如果要走 /v1/responses，请使用 openaiCodex provider。
+        baseUrl: http://127.0.0.1:8317/v1
+        # 允许在 usage 中选择的 OpenAI 模型白名单。
+        models:
+          - gpt-5.4
+      openaiCodex:
+        # OpenAI Codex provider 的 key。走本地 bridge 时可使用占位值。
+        apiKey: ""
+        # OpenAI Codex Responses bridge 地址。
+        baseUrl: http://127.0.0.1:8317/v1/responses
+        # 允许在 usage 中选择的 Codex 模型白名单；usage 里写的模型必须在这里。
+        models:
+          - gpt-5
+          - gpt-5.4
+      # claudeCode:
+      #   # Claude Code provider 的 key。走本地 bridge 时可使用占位值。
+      #   apiKey: ""
+      #   # Claude Code bridge 地址。
+      #   baseUrl: http://127.0.0.1:8317
+      #   # 允许在 usage 中选择的 Claude 模型白名单。
+      #   models:
+      #     - claude-sonnet-4-5-20250929
+
+    usages:
+      agent:
+        # 主 Root Agent 使用的模型链路，负责群聊/私聊主要回复和工具决策。
+        attempts:
+#          - provider: deepseek
+#            model: deepseek-v4-pro
+          - provider: openai-codex
+            model: gpt-5.4
+            # 当前 attempt 重试次数。
+            times: 1
+      storyAgent:
+        # Story Agent 使用的模型链路，负责把聊天内容整理为长期记忆。
+        attempts:
+          # - provider: claude-code
+          #   model: claude-sonnet-4-5-20250929
+          - provider: openai-codex
+            model: gpt-5.4
+      contextSummarizer:
+        # 上下文压缩/摘要使用的模型链路。
+        attempts:
+          - provider: openai-codex
+            model: gpt-5.4
+      memoryQuery:
+        # 长期记忆召回前的查询改写模型链路，只负责把最近上下文改写成一句检索 query。
+        attempts:
+          - provider: openai-codex
+            model: gpt-5.4
+      vision:
+        # 图片消息分析使用的模型链路。
+        attempts:
+          - provider: openai-codex
+            model: gpt-5.4
+      webSearchAgent:
+        # 搜索子 Agent 使用的模型链路；当前 search_web 已改为直接搜索，通常不会触发该 usage。
+        attempts:
+          - provider: openai-codex
+            model: gpt-5.4
+
+  tavily:
+    # Tavily 搜索 API key；为空时 search_web 会退化为内置空搜索/无外网搜索结果。
+    apiKey: ""
