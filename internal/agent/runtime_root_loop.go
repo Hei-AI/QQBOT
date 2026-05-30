@@ -23,11 +23,29 @@ func (a *AgentRuntime) rootLoop(ctx context.Context) {
 			a.waitForNextEvent(ctx)
 			continue
 		}
-		if a.runRootRound(ctx) {
+		disposition := a.runRootRound(ctx)
+		for step := 1; disposition == rootRoundContinue && step < maxRootContinuationSteps; step++ {
+			log.Printf("[AGENT] continue root action chain step=%d", step+1)
+			disposition = a.runRootRound(ctx)
+		}
+		if disposition == rootRoundContinue {
+			log.Printf("[AGENT] root action chain reached max steps=%d; waiting for next event", maxRootContinuationSteps)
+		}
+		if disposition == rootRoundPause || disposition == rootRoundContinue {
 			a.waitForNextEvent(ctx)
 		}
 	}
 }
+
+const maxRootContinuationSteps = 8
+
+type rootRoundDisposition int
+
+const (
+	rootRoundIdle rootRoundDisposition = iota
+	rootRoundContinue
+	rootRoundPause
+)
 
 func (a *AgentRuntime) consumeEvents() bool {
 	a.mu.Lock()
@@ -171,9 +189,9 @@ func (a *AgentRuntime) groupReplyCooldown() time.Duration {
 	return 20 * time.Second
 }
 
-func (a *AgentRuntime) runRootRound(ctx context.Context) bool {
+func (a *AgentRuntime) runRootRound(ctx context.Context) rootRoundDisposition {
 	if a.llm == nil || a.rootContextLen() == 0 {
-		return false
+		return rootRoundIdle
 	}
 	a.mu.Lock()
 	a.loopState = "calling_root_llm"
@@ -199,7 +217,7 @@ func (a *AgentRuntime) runRootRound(ctx context.Context) bool {
 			a.hooks.OnAfterRootRound(ctx, a, agentruntime.RoundResult{}, retryErr)
 			log.Printf("[AGENT] root round=1 error=%v", retryErr)
 			a.setRuntimeError(retryErr)
-			return false
+			return rootRoundIdle
 		}
 	}
 	a.hooks.OnAfterRootRound(ctx, a, result, err)
@@ -241,12 +259,27 @@ func (a *AgentRuntime) runRootRound(ctx context.Context) bool {
 	a.recordLLMCall(result.Completion)
 	a.persistSnapshot()
 	a.hooks.OnAfterRootCommit(ctx, a, result)
-	return shouldPause
+	return rootDispositionForExecutions(result.ToolExecutions, shouldPause)
 }
 
 func (a *AgentRuntime) waitForNextEvent(ctx context.Context) {
-	log.Printf("[AGENT] terminal conversation action completed; waiting for next event")
+	log.Printf("[AGENT] waiting for next event")
 	a.events.WaitForEvent(ctx)
+}
+
+func rootDispositionForExecutions(executions []agentruntime.ToolExecution, shouldPause bool) rootRoundDisposition {
+	if shouldPause {
+		return rootRoundPause
+	}
+	if len(executions) == 0 {
+		return rootRoundIdle
+	}
+	for _, execution := range executions {
+		if execution.Call.Name == "wait" {
+			return rootRoundIdle
+		}
+	}
+	return rootRoundContinue
 }
 
 func (a *AgentRuntime) retryRootRoundOnce(ctx context.Context, tools *agentruntime.ToolCatalog) (agentruntime.RoundResult, error) {

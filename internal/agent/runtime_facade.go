@@ -72,6 +72,7 @@ func NewAgentRuntime(cfg *config.Config, store *db.Store, events *EventQueue, ll
 	if strings.TrimSpace(cfg.Server.Tavily.APIKey) != "" {
 		searchService = websearch.TavilyService{APIKey: cfg.Server.Tavily.APIKey}
 	}
+	searchService = websearch.URLAwareService{Fallback: searchService}
 	terminalService, err := terminal.NewService(terminal.Config{
 		InitialCwd:        cfg.Server.Agent.Terminal.InitialCWD,
 		CommandTimeout:    time.Duration(cfg.Server.Agent.Terminal.CommandTimeoutMs) * time.Millisecond,
@@ -284,7 +285,7 @@ func invokeToolGuide() string {
 		"- 控制工具：enter 只能从 portal 进入子状态；back 返回上一级；wait 等待新事件；invoke 调用当前状态允许的业务工具。",
 		"- portal：没有可直接 invoke 的业务工具，请先 enter 到 QQ 群、私聊、IT之家、终端或神游。",
 		"- QQ 群/私聊状态：可 invoke send_message、search_web、search_memory。send_message 的 arguments 必须包含非空 message；可省略 targetType/targetId，系统会使用当前会话。没有要发的内容就调用 wait。",
-		"- 需要补充外部事实时：在 QQ 群/私聊状态下 invoke search_web，arguments 参数：query。",
+		"- 需要补充外部事实或读取网页链接时：在 QQ 群/私聊状态下 invoke search_web，arguments 参数：query。完整 URL 会优先直接读取页面，读取失败后再搜索。",
 		"- 需要主动查找长期叙事记忆时：在 QQ 群/私聊状态下 invoke search_memory，arguments 参数：query。",
 		"- IT之家状态：仅可 invoke open_ithome_article，arguments 参数：articleId。看完想分享时先 back 回 portal，再 enter 对应群聊。",
 		"- 终端状态：仅可 invoke bash、read_bash_output。",

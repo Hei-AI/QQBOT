@@ -212,6 +212,35 @@ func TestWaitTimeoutWakeDoesNotTriggerRoot(t *testing.T) {
 	}
 }
 
+func TestRootDispositionContinuesAfterNavigation(t *testing.T) {
+	for _, name := range []string{"enter", "back"} {
+		got := rootDispositionForExecutions([]agentruntime.ToolExecution{{Call: agentruntime.ToolCall{Name: name}}}, false)
+		if got != rootRoundContinue {
+			t.Fatalf("%s should continue the current root action chain, got %v", name, got)
+		}
+	}
+}
+
+func TestRootDispositionContinuesAfterNonTerminalInvoke(t *testing.T) {
+	got := rootDispositionForExecutions([]agentruntime.ToolExecution{{
+		Call: agentruntime.ToolCall{Name: "invoke", Arguments: map[string]any{"tool": "search_web"}},
+	}}, false)
+	if got != rootRoundContinue {
+		t.Fatalf("search_web should continue the current root action chain, got %v", got)
+	}
+}
+
+func TestRootDispositionStopsAfterWaitOrConversationAction(t *testing.T) {
+	if got := rootDispositionForExecutions([]agentruntime.ToolExecution{{Call: agentruntime.ToolCall{Name: "wait"}}}, false); got != rootRoundIdle {
+		t.Fatalf("wait should hand control back to the event loop, got %v", got)
+	}
+	if got := rootDispositionForExecutions([]agentruntime.ToolExecution{{
+		Call: agentruntime.ToolCall{Name: "invoke", Arguments: map[string]any{"tool": "send_message"}},
+	}}, true); got != rootRoundPause {
+		t.Fatalf("send_message should wait for the next event, got %v", got)
+	}
+}
+
 func TestEventQueueWaitIgnoresStaleWakeupSignal(t *testing.T) {
 	queue := NewEventQueue()
 	queue.Enqueue(AgentEvent{Type: "old_event"})

@@ -23,7 +23,7 @@ func (t *WebSearchTaskAgentTool) SetModel(model agentruntime.Model) {
 }
 
 func (t *WebSearchTaskAgentTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "search_web", Description: "搜索互联网并返回一段可靠中文摘要", Parameters: agentruntime.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}})}
+	return agentruntime.ToolDefinition{Name: "search_web", Description: "读取网页 URL 或搜索互联网，并返回一段可靠中文摘要", Parameters: agentruntime.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}})}
 }
 
 func (t *WebSearchTaskAgentTool) Kind() string { return "business" }

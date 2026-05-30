@@ -11,7 +11,7 @@ import (
 type SearchWebRawTool struct{ Service Service }
 
 func (t SearchWebRawTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "search_web_raw", Description: "执行原始网页搜索", Parameters: agentruntime.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}, "maxResults": map[string]any{"type": "integer"}})}
+	return agentruntime.ToolDefinition{Name: "search_web_raw", Description: "读取网页 URL 或执行原始网页搜索", Parameters: agentruntime.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}, "maxResults": map[string]any{"type": "integer"}})}
 }
 func (t SearchWebRawTool) Kind() string { return "business" }
 func (t SearchWebRawTool) Execute(ctx context.Context, call agentruntime.ToolCall) (agentruntime.ToolResult, error) {
@@ -44,7 +44,7 @@ func (FinalizeWebSearchTool) Execute(_ context.Context, call agentruntime.ToolCa
 type SearchWebTool struct{ Service Service }
 
 func (t SearchWebTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "search_web", Description: "搜索互联网并返回结果", Parameters: agentruntime.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}})}
+	return agentruntime.ToolDefinition{Name: "search_web", Description: "读取网页 URL 或搜索互联网并返回结果", Parameters: agentruntime.ObjectSchema(map[string]any{"query": map[string]any{"type": "string"}})}
 }
 func (t SearchWebTool) Kind() string { return "business" }
 func (t SearchWebTool) Execute(ctx context.Context, call agentruntime.ToolCall) (agentruntime.ToolResult, error) {
