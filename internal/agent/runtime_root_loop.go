@@ -282,7 +282,7 @@ func (a *AgentRuntime) runRootRound(ctx context.Context) rootRoundDisposition {
 			a.appendRootContext(layer, agentruntime.Message{Role: "user", Content: effect.VisibleContext})
 			a.appendContext(contextItem("system_reminder", execution.Call.Name, effect.VisibleContext))
 		}
-		if sentMessage := sentMessageContextMessage(execution); sentMessage.Content != "" {
+		if sentMessage := sentMessageContextMessage(execution, "帕秋莉", a.cfg.Server.Bot.QQ, time.Now()); sentMessage.Content != "" {
 			a.appendRootContext(RootContextLayerAssistant, sentMessage)
 			a.appendContext(contextItem("assistant_sent_message", "send_message", sentMessage.Content))
 			a.recordSentMessage(execution)

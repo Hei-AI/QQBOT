@@ -44,6 +44,17 @@ func QQMessageAt(nickname, userID, messageBody string, t time.Time) string {
 </qq_message>`, bt.Format("2006-01-02 15:04:05 -07:00"), nickname, userID, messageBody)
 }
 
+func SelfQQMessageAt(nickname, userID, messageBody string, t time.Time) string {
+	bt := t
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		bt = t.In(loc)
+	}
+	return fmt.Sprintf(`<qq_message time="%s" self="true">
+%s (%s):
+%s
+</qq_message>`, bt.Format("2006-01-02 15:04:05 -07:00"), nickname, userID, messageBody)
+}
+
 func ConversationSummary(summary string) string {
 	return fmt.Sprintf(`<conversation_summary>
 %s

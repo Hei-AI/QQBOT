@@ -203,7 +203,7 @@ func shouldPersistRootToolCall(toolName string, tools *agentruntime.ToolCatalog)
 	return tool.Kind() != "control" || toolName == "wait"
 }
 
-func sentMessageContextMessage(execution agentruntime.ToolExecution) agentruntime.Message {
+func sentMessageContextMessage(execution agentruntime.ToolExecution, nickname, userID string, sentAt time.Time) agentruntime.Message {
 	if execution.Call.Name != "invoke" || invokeToolName(execution.Call) != "send_message" {
 		return agentruntime.Message{}
 	}
@@ -224,7 +224,7 @@ func sentMessageContextMessage(execution agentruntime.ToolExecution) agentruntim
 	if message == "" {
 		return agentruntime.Message{}
 	}
-	return agentruntime.Message{Role: "assistant", Content: message}
+	return agentruntime.Message{Role: "assistant", Content: prompts.SelfQQMessageAt(nickname, userID, message, sentAt)}
 }
 
 func (a *AgentRuntime) recordSentMessage(execution agentruntime.ToolExecution) {

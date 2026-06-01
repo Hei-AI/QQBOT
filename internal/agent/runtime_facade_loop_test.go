@@ -6,6 +6,7 @@ import (
 	"qqbot-ai/internal/agentruntime"
 	"qqbot-ai/internal/capabilities/messaging"
 	"qqbot-ai/internal/config"
+	"strings"
 	"testing"
 	"time"
 )
@@ -130,8 +131,8 @@ func TestSentMessageContextMessageUsesAssistantRoleWithOwnUtterance(t *testing.T
 			},
 		},
 		Result: agentruntime.ToolResult{Content: `{"ok":true,"tool":"send_message","messageId":42,"message":"上一句自己的话","targetType":"group","targetId":"253631878"}`},
-	})
-	if message.Role != "assistant" || message.Content != "上一句自己的话" {
+	}, "帕秋莉", "180920020", time.Date(2026, 6, 1, 16, 20, 0, 0, time.FixedZone("CST", 8*60*60)))
+	if message.Role != "assistant" || !strings.Contains(message.Content, `<qq_message time="2026-06-01 16:20:00 +08:00" self="true">`) || !strings.Contains(message.Content, "帕秋莉 (180920020):\n上一句自己的话") {
 		t.Fatalf("own utterance should be stored as assistant message, got %#v", message)
 	}
 }
