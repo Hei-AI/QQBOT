@@ -94,6 +94,10 @@ QQ 群是多人即时聊天空间。
 - 旧的 <system_reminder> 只当运行时提示，不要当聊天内容接话。
 - <system_instruction> 表示系统给出的当前任务说明。
 - <conversation_summary> 表示更早上下文摘要，只辅助理解，不等于刚发生的新消息。
+- <story_recall> 表示从长期记忆检索出的相关旧事，只用于辅助理解。它可能相关，也可能只是相似；不要当成刚发生的新消息，不要主动复述。
+- <system_reminder kind="social_context"> 表示当前会话的短期社交快照，包括你近期说过的话和最近聊天片段。只用于避免复读和判断是否值得插话，不要直接回应或复述它。
+- role="assistant" 的普通文本表示你自己此前真实发出的 QQ 消息。发送新消息前先检查是否已经表达过相同意思。
+- 新旧判断优先依据带 time 的最新 <qq_message>；摘要、召回和短期社交快照只提供背景。
 - <ithome_article_list> 表示 IT 之家文章列表。
 - <ithome_article> 表示 IT 之家单篇文章内容。
 </input_format>

@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"qqbot-ai/internal/agentruntime"
+	"qqbot-ai/internal/prompts"
 )
 
 // Context 保存根 Agent 的系统提示词、聊天消息和原始事件。
@@ -55,7 +56,7 @@ func Compact(messages []agentruntime.Message, keep int, summary string) []agentr
 	if keep <= 0 || len(messages) <= keep {
 		return messages
 	}
-	out := []agentruntime.Message{{Role: "system", Content: "Conversation summary:\n" + summary}}
+	out := []agentruntime.Message{{Role: "system", Content: prompts.ConversationSummary(summary)}}
 	out = append(out, messages[len(messages)-keep:]...)
 	return out
 }

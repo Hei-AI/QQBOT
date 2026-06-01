@@ -2,6 +2,7 @@ package agent
 
 import (
 	"qqbot-ai/internal/agentruntime"
+	"qqbot-ai/internal/prompts"
 	"sort"
 	"strings"
 	"time"
@@ -131,7 +132,7 @@ func (m *RootContextManager) CompactIfNeeded(totalTokens, threshold int, summari
 		return "", false
 	}
 	summary := summarize(messages[:cutIndex])
-	kept := append([]agentruntime.Message{{Role: "system", Content: "以下是已压缩的历史上下文摘要：\n" + summary}}, messages[cutIndex:]...)
+	kept := append([]agentruntime.Message{{Role: "system", Content: prompts.ConversationSummary(summary)}}, messages[cutIndex:]...)
 	m.ReplaceMessages(kept)
 	return summary, true
 }
@@ -252,7 +253,7 @@ func appendAndKeepRecent(entries []RootContextEntry, entry RootContextEntry, max
 func classifyRootContextLayer(msg agentruntime.Message) RootContextLayer {
 	content := msg.Content
 	switch {
-	case containsRootContextMarker(content, "以下是已压缩的历史上下文摘要"):
+	case containsRootContextMarker(content, "<conversation_summary>") || containsRootContextMarker(content, "以下是已压缩的历史上下文摘要"):
 		return RootContextLayerSummary
 	case containsRootContextMarker(content, "<story_recall>"):
 		return RootContextLayerRecall

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"qqbot-ai/internal/agentruntime"
+	"qqbot-ai/internal/prompts"
 	"strings"
 )
 
@@ -164,7 +165,7 @@ func trimRootMessagesToBudget(messages []agentruntime.Message, maxMessages, maxC
 	}
 	messages = trimLeadingToolMessages(messages)
 	if dropped > 0 {
-		summary := fmt.Sprintf("<conversation_summary>较早的 %d 条运行时上下文已清理，以避免请求过大；保留最近对话、状态和必要工具结果。</conversation_summary>", dropped)
+		summary := prompts.ConversationSummary(fmt.Sprintf("较早的 %d 条运行时上下文已清理，以避免请求过大；保留最近对话、状态和必要工具结果。", dropped))
 		messages = append([]agentruntime.Message{{Role: "user", Content: summary}}, messages...)
 	}
 	return messages

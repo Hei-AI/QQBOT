@@ -50,6 +50,9 @@ func TestRootContextManagerCompactIfNeeded(t *testing.T) {
 	if !strings.Contains(got[0].Content, "压缩摘要") {
 		t.Fatalf("summary message missing: %#v", got[0])
 	}
+	if !strings.Contains(got[0].Content, "<conversation_summary>") {
+		t.Fatalf("summary message was not wrapped consistently: %#v", got[0])
+	}
 }
 
 func TestRootContextManagerCompactionKeepsAssistantToolBoundaryTogether(t *testing.T) {
@@ -152,7 +155,7 @@ func TestRootContextManagerAssemblesStablePromptOrder(t *testing.T) {
 
 func TestRootContextManagerClassifiesSummary(t *testing.T) {
 	manager := NewRootContextManager([]agentruntime.Message{
-		{Role: "system", Content: "以下是已压缩的历史上下文摘要：\n摘要"},
+		{Role: "system", Content: "<conversation_summary>\n摘要\n</conversation_summary>"},
 	})
 
 	if got := len(manager.EntriesByLayer(RootContextLayerSummary)); got != 1 {

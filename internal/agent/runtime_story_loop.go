@@ -79,7 +79,7 @@ func (a *AgentRuntime) compactStoryMessagesIfNeeded() {
 	summary := summarizeMessages(a.storyMessages[:cut])
 	a.storyMessages = append([]agentruntime.Message{{
 		Role:    "system",
-		Content: "<conversation_summary>\n" + summary + "\n</conversation_summary>",
+		Content: prompts.ConversationSummary(summary),
 	}}, a.storyMessages[cut:]...)
 }
 
