@@ -405,3 +405,55 @@ func TestTerminalConversationActionWaitsForNextEvent(t *testing.T) {
 		t.Fatalf("waitForNextEvent should not consume events, got %#v", events)
 	}
 }
+
+func TestEventQueueDequeueBurstCollectsAdjacentEvents(t *testing.T) {
+	queue := NewEventQueue()
+	queue.Enqueue(AgentEvent{Type: "first"})
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		queue.Enqueue(AgentEvent{Type: "second"})
+	}()
+	events := queue.DequeueBurst(context.Background(), 25*time.Millisecond, 100*time.Millisecond)
+	if len(events) != 2 || events[0].Type != "first" || events[1].Type != "second" {
+		t.Fatalf("unexpected burst: %#v", events)
+	}
+}
+
+func TestSimilarOutgoingMessageIsSuppressed(t *testing.T) {
+	runtime := &AgentRuntime{
+		sentChatHistory: []sentChatMessage{{
+			Target:  chatReplyTarget{Type: "group", ID: "1"},
+			Message: "这已经不是 keepalive 了，这是僵尸连接",
+		}},
+	}
+	err := runtime.validateOutgoingMessage(chatReplyTarget{Type: "group", ID: "1"}, "这已经不是keepalive了，这是僵尸连接。")
+	if err == nil {
+		t.Fatal("expected repeated outgoing message to be suppressed")
+	}
+}
+
+func TestDifferentOutgoingMessageIsAllowed(t *testing.T) {
+	runtime := &AgentRuntime{
+		sentChatHistory: []sentChatMessage{{
+			Target:  chatReplyTarget{Type: "group", ID: "1"},
+			Message: "先吃饭",
+		}},
+	}
+	err := runtime.validateOutgoingMessage(chatReplyTarget{Type: "group", ID: "1"}, "甜辣登机口在哪边")
+	if err != nil {
+		t.Fatalf("unexpected suppression: %v", err)
+	}
+}
+
+func TestSubAgentCircuitOpensAfterRepeatedFailures(t *testing.T) {
+	runtime := &AgentRuntime{
+		subAgentFailures:  map[string]int{},
+		subAgentOpenUntil: map[string]time.Time{},
+	}
+	for i := 0; i < 3; i++ {
+		runtime.reportSubAgentResult("memoryQuery", context.DeadlineExceeded)
+	}
+	if runtime.subAgentAllowed("memoryQuery") {
+		t.Fatal("expected memoryQuery circuit to be open")
+	}
+}

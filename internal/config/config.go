@@ -32,15 +32,20 @@ type AgentConfig struct {
 	LLMRetryBackoffMs                    int            `yaml:"llmRetryBackoffMs"`
 	WaitToolMaxWaitMs                    int            `yaml:"waitToolMaxWaitMs"`
 	NotificationBatchWindowMs            int            `yaml:"notificationBatchWindowMs"`
+	EventBurstQuietMs                    int            `yaml:"eventBurstQuietMs"`
+	EventBurstMaxWaitMs                  int            `yaml:"eventBurstMaxWaitMs"`
+	GroupReplyCooldownMs                 int            `yaml:"groupReplyCooldownMs"`
+	SubAgentTimeoutMs                    int            `yaml:"subAgentTimeoutMs"`
 	Story                                StoryConfig    `yaml:"story"`
 	Terminal                             TerminalConfig `yaml:"terminal"`
 }
 
 // StoryConfig 控制 Story 批处理、记忆和召回行为。
 type StoryConfig struct {
-	BatchSize   int `yaml:"batchSize"`
-	IdleFlushMs int `yaml:"idleFlushMs"`
-	Memory      struct {
+	BatchSize       int `yaml:"batchSize"`
+	IdleFlushMs     int `yaml:"idleFlushMs"`
+	LedgerKeepCount int `yaml:"ledgerKeepCount"`
+	Memory          struct {
 		Embedding EmbeddingConfig `yaml:"embedding"`
 	} `yaml:"memory"`
 	Recall struct {
@@ -165,6 +170,21 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Server.Agent.Story.IdleFlushMs == 0 {
 		cfg.Server.Agent.Story.IdleFlushMs = int((2 * time.Minute).Milliseconds())
+	}
+	if cfg.Server.Agent.EventBurstQuietMs == 0 {
+		cfg.Server.Agent.EventBurstQuietMs = 1200
+	}
+	if cfg.Server.Agent.EventBurstMaxWaitMs == 0 {
+		cfg.Server.Agent.EventBurstMaxWaitMs = 3000
+	}
+	if cfg.Server.Agent.GroupReplyCooldownMs == 0 {
+		cfg.Server.Agent.GroupReplyCooldownMs = 20000
+	}
+	if cfg.Server.Agent.SubAgentTimeoutMs == 0 {
+		cfg.Server.Agent.SubAgentTimeoutMs = 30000
+	}
+	if cfg.Server.Agent.Story.LedgerKeepCount == 0 {
+		cfg.Server.Agent.Story.LedgerKeepCount = 1000
 	}
 	if cfg.Server.Napcat.ReconnectMs == 0 {
 		cfg.Server.Napcat.ReconnectMs = 3000

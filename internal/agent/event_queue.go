@@ -54,6 +54,39 @@ func (q *EventQueue) DequeueAll() []AgentEvent {
 	}
 }
 
+// DequeueBurst drains the current queue and briefly waits for adjacent events.
+// QQ messages often arrive in short bursts; giving the sender a moment to finish
+// makes the root agent react to the conversation instead of every fragment.
+func (q *EventQueue) DequeueBurst(ctx context.Context, quiet, maxWait time.Duration) []AgentEvent {
+	out := q.DequeueAll()
+	if len(out) == 0 || quiet <= 0 || maxWait <= 0 {
+		return out
+	}
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	quietTimer := time.NewTimer(quiet)
+	defer quietTimer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return out
+		case <-deadline.C:
+			return append(out, q.DequeueAll()...)
+		case <-quietTimer.C:
+			return append(out, q.DequeueAll()...)
+		case <-q.wakeup:
+			out = append(out, q.DequeueAll()...)
+			if !quietTimer.Stop() {
+				select {
+				case <-quietTimer.C:
+				default:
+				}
+			}
+			quietTimer.Reset(quiet)
+		}
+	}
+}
+
 func (q *EventQueue) Count() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()

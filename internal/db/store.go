@@ -230,6 +230,8 @@ func (s *Store) initSchema() error {
 		`CREATE TABLE IF NOT EXISTS llm_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS napcat_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS napcat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_napcat_messages_type_group ON napcat_messages(json_extract(item, '$.messageType'), json_extract(item, '$.groupId'), id)`,
+		`CREATE INDEX IF NOT EXISTS idx_napcat_messages_type_user ON napcat_messages(json_extract(item, '$.messageType'), json_extract(item, '$.userId'), id)`,
 		`CREATE TABLE IF NOT EXISTS story_ledger (seq INTEGER PRIMARY KEY AUTOINCREMENT, runtime_key TEXT NOT NULL, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS idx_story_ledger_runtime_seq ON story_ledger(runtime_key, seq)`,
 		`CREATE TABLE IF NOT EXISTS stories (id TEXT PRIMARY KEY, updated_at TEXT NOT NULL, item TEXT NOT NULL)`,
@@ -239,6 +241,7 @@ func (s *Store) initSchema() error {
 		`CREATE TABLE IF NOT EXISTS metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS metric_charts (chart_name TEXT PRIMARY KEY, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS news_articles (id INTEGER PRIMARY KEY AUTOINCREMENT, source_key TEXT NOT NULL, upstream_id TEXT NOT NULL, item TEXT NOT NULL, UNIQUE(source_key, upstream_id))`,
+		`CREATE INDEX IF NOT EXISTS idx_news_articles_source_id ON news_articles(source_key, id)`,
 		`CREATE TABLE IF NOT EXISTS news_feed_cursors (source_key TEXT PRIMARY KEY, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS agent_snapshots (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 	}
@@ -446,6 +449,65 @@ func (s *Store) ListStoryLedgerAfter(runtimeKey string, afterSeq, limit int) []S
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return queryJSONRows[StoryLedgerItem](s.db, query, args...)
+}
+
+// PruneStoryLedgerThrough keeps only a small processed tail while preserving
+// every unprocessed item after throughSeq.
+func (s *Store) PruneStoryLedgerThrough(runtimeKey string, throughSeq, keepProcessed int) {
+	if throughSeq <= 0 || keepProcessed < 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.db.Exec(`DELETE FROM story_ledger
+		WHERE runtime_key = ? AND seq <= ? AND seq NOT IN (
+			SELECT seq FROM story_ledger WHERE runtime_key = ? AND seq <= ? ORDER BY seq DESC LIMIT ?
+		)`, runtimeKey, throughSeq, runtimeKey, throughSeq, keepProcessed)
+}
+
+func (s *Store) ListStories() []StoryItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return queryJSONRows[StoryItem](s.db, `SELECT item FROM stories ORDER BY updated_at ASC`)
+}
+
+func (s *Store) RecentNapcatMessages(messageType, id string, limit int) []NapcatMessageItem {
+	if limit <= 0 {
+		return nil
+	}
+	query := `SELECT item FROM napcat_messages WHERE json_extract(item, '$.messageType') = ?`
+	args := []any{messageType}
+	if messageType == "group" {
+		query += ` AND json_extract(item, '$.groupId') = ?`
+		args = append(args, id)
+	} else {
+		query += ` AND json_extract(item, '$.userId') = ?`
+		args = append(args, id)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := queryJSONRows[NapcatMessageItem](s.db, query, args...)
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+	return items
+}
+
+func (s *Store) ListNewsArticlesBySource(sourceKey string) []NewsArticle {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return queryJSONRows[NewsArticle](s.db, `SELECT item FROM news_articles WHERE source_key = ? ORDER BY id DESC`, sourceKey)
+}
+
+func (s *Store) FindNewsArticleByID(id int) (NewsArticle, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var raw string
+	err := s.db.QueryRow(`SELECT item FROM news_articles WHERE id = ?`, id).Scan(&raw)
+	var article NewsArticle
+	return article, err == nil && json.Unmarshal([]byte(raw), &article) == nil
 }
 
 func (s *Store) AddMetric(name string, value float64, tags map[string]string) {

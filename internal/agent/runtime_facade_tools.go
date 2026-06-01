@@ -16,7 +16,7 @@ func (a *AgentRuntime) rootControlTools() *agentruntime.ToolCatalog {
 		facadeBackTool{Session: a.session},
 		facadeZoneOutTool{Session: a.session},
 		facadeWaitTool{Queue: a.events, MaxWait: a.waitToolMaxWait()},
-		facadeInvokeTool{Tools: a.rootTools, Session: a.session},
+		facadeInvokeTool{Tools: a.rootTools, Session: a.session, BeforeSend: a.validateOutgoingMessage},
 	)
 }
 
@@ -86,8 +86,9 @@ func waitResumeContent(reason string) string {
 }
 
 type facadeInvokeTool struct {
-	Tools   *agentruntime.ToolCatalog
-	Session *rootSession
+	Tools      *agentruntime.ToolCatalog
+	Session    *rootSession
+	BeforeSend func(chatReplyTarget, string) error
 }
 
 func (facadeInvokeTool) Definition() agentruntime.ToolDefinition {
@@ -159,6 +160,17 @@ func (t facadeInvokeTool) Execute(ctx context.Context, call agentruntime.ToolCal
 			}
 			if common.AsString(args["targetId"]) == "" {
 				args["targetId"] = target.ID
+			}
+		}
+		if t.BeforeSend != nil {
+			target := chatReplyTarget{Type: strings.TrimSpace(common.AsString(args["targetType"])), ID: strings.TrimSpace(common.AsString(args["targetId"]))}
+			if err := t.BeforeSend(target, common.AsString(args["message"])); err != nil {
+				return agentruntime.ToolResult{Kind: "business", Content: mustSessionJSON(map[string]any{
+					"ok":        false,
+					"error":     "SEND_SUPPRESSED",
+					"message":   err.Error(),
+					"ephemeral": true,
+				})}, nil
 			}
 		}
 	}

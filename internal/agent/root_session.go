@@ -509,8 +509,7 @@ func (s *rootSession) portalFeeds() []prompts.PortalTarget {
 }
 
 func (s *rootSession) ithomeArticleList(previousUnread int) string {
-	data := s.store.Snapshot()
-	articles := ithomeArticlesNewestFirst(data.NewsArticles)
+	articles := ithomeArticlesNewestFirst(s.store.ListNewsArticlesBySource("ithome"))
 	cursor, hasCursor := s.store.NewsFeedCursor("ithome")
 	modeNew := false
 	totalNew := 0
@@ -615,13 +614,13 @@ func (s *rootSession) pushNotificationLocked(stateID string) {
 	}
 }
 
-func (s *rootSession) flushNotificationsIfReady(window time.Duration) string {
+func (s *rootSession) flushNotificationsIfReady(window time.Duration, force bool) string {
 	if window <= 0 {
 		window = 30 * time.Second
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.notifications) == 0 || time.Since(s.lastNotifyFlush) < window {
+	if len(s.notifications) == 0 || (!force && time.Since(s.lastNotifyFlush) < window) {
 		return ""
 	}
 	entries := make([]notificationEntry, 0, len(s.notifications))
@@ -730,17 +729,8 @@ func (s *rootSession) recentMessages(kind, id string) []string {
 	if s.store == nil {
 		return nil
 	}
-	data := s.store.Snapshot()
 	out := []string{}
-	for i := len(data.NapcatMessages) - 1; i >= 0; i-- {
-		msg := data.NapcatMessages[i]
-		if kind == "group" {
-			if msg.MessageType != "group" || msg.GroupID == nil || *msg.GroupID != id {
-				continue
-			}
-		} else if msg.MessageType != "private" || msg.UserID == nil || *msg.UserID != id {
-			continue
-		}
+	for _, msg := range s.store.RecentNapcatMessages(kind, id, limit) {
 		nickname := "未知用户"
 		if msg.Nickname != nil && *msg.Nickname != "" {
 			nickname = *msg.Nickname
@@ -758,12 +748,6 @@ func (s *rootSession) recentMessages(kind, id string) []string {
 			messageTime = *msg.EventTime
 		}
 		out = append(out, prompts.QQMessageAt(nickname, userID, raw, messageTime))
-		if len(out) >= limit {
-			break
-		}
-	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
 	}
 	return out
 }

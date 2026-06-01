@@ -20,6 +20,9 @@ func (a *AgentRuntime) runStoryBatchWithRange(ctx context.Context, messages []ag
 	if a.llm == nil || len(messages) == 0 {
 		return
 	}
+	if !a.subAgentAllowed("storyAgent") {
+		return
+	}
 	a.hooks.OnBeforeStoryBatch(ctx, a, messages, startSeq, endSeq)
 	var batchErr error
 	defer func() {
@@ -27,6 +30,9 @@ func (a *AgentRuntime) runStoryBatchWithRange(ctx context.Context, messages []ag
 	}()
 	tools := buildStoryToolsForRange(a.cfg, a.store, startSeq, endSeq)
 	a.storyMessages = append(a.storyMessages, messages...)
+	a.compactStoryMessagesIfNeeded()
+	ctx, cancel := context.WithTimeout(ctx, a.subAgentTimeout())
+	defer cancel()
 	for i := 0; i < 6; i++ {
 		log.Printf("[AGENT] story round=%d messages=%d", i+1, len(a.storyMessages))
 		result, err := a.storyKernel.RunRound(ctx, agentruntime.RoundInput{
@@ -37,6 +43,7 @@ func (a *AgentRuntime) runStoryBatchWithRange(ctx context.Context, messages []ag
 		})
 		if err != nil {
 			batchErr = err
+			a.reportSubAgentResult("storyAgent", err)
 			log.Printf("[AGENT] story round=%d error=%v", i+1, err)
 			a.setRuntimeError(err)
 			return
@@ -50,14 +57,30 @@ func (a *AgentRuntime) runStoryBatchWithRange(ctx context.Context, messages []ag
 			a.recordToolExecution(execution)
 			if execution.Call.Name == "finish_story_batch" {
 				a.storyLastSeq = endSeq
+				a.storyMessages = nil
+				a.store.PruneStoryLedgerThrough("root", endSeq, a.storyLedgerKeepCount())
 				finished = true
 			}
 		}
 		if finished || len(result.ToolExecutions) == 0 {
+			a.reportSubAgentResult("storyAgent", nil)
 			break
 		}
 	}
 	a.persistSnapshot()
+}
+
+func (a *AgentRuntime) compactStoryMessagesIfNeeded() {
+	const keep = 36
+	if len(a.storyMessages) <= 72 {
+		return
+	}
+	cut := len(a.storyMessages) - keep
+	summary := summarizeMessages(a.storyMessages[:cut])
+	a.storyMessages = append([]agentruntime.Message{{
+		Role:    "system",
+		Content: "<conversation_summary>\n" + summary + "\n</conversation_summary>",
+	}}, a.storyMessages[cut:]...)
 }
 
 func (a *AgentRuntime) loadPendingStoryBatch() ([]agentruntime.Message, int, int) {
@@ -83,9 +106,13 @@ func (a *AgentRuntime) injectStoryRecallIfNeeded() {
 	if a.store == nil {
 		return
 	}
+	if !a.subAgentAllowed("memoryQuery") {
+		return
+	}
 	a.mu.Lock()
 	messageCount := a.rootContextLen()
-	if messageCount == a.lastRecallCount {
+	chatRevision := a.chatRevision
+	if chatRevision == a.lastRecallRevision {
 		a.mu.Unlock()
 		return
 	}
@@ -95,6 +122,7 @@ func (a *AgentRuntime) injectStoryRecallIfNeeded() {
 	if strings.TrimSpace(query) == "" {
 		a.mu.Lock()
 		a.lastRecallCount = messageCount
+		a.lastRecallRevision = chatRevision
 		a.mu.Unlock()
 		return
 	}
@@ -107,13 +135,18 @@ func (a *AgentRuntime) injectStoryRecallIfNeeded() {
 		Repo:   storeStoryRepository{store: a.store, indexer: nil},
 		Recall: storycap.NewVectorRecall(a.cfg, a.store),
 	}
-	items, err := storyService.Search(context.Background(), query, topK)
+	ctx, cancel := context.WithTimeout(context.Background(), a.subAgentTimeout())
+	defer cancel()
+	items, err := storyService.Search(ctx, query, topK)
 	if err != nil {
+		a.reportSubAgentResult("memoryRecall", err)
 		a.mu.Lock()
 		a.lastRecallCount = messageCount
+		a.lastRecallRevision = chatRevision
 		a.mu.Unlock()
 		return
 	}
+	a.reportSubAgentResult("memoryRecall", nil)
 	parts := []string{}
 	a.mu.Lock()
 	for _, item := range items {
@@ -130,6 +163,7 @@ func (a *AgentRuntime) injectStoryRecallIfNeeded() {
 		parts = append(parts, "你想起了一件事情：\n\n"+item.Markdown)
 	}
 	a.lastRecallCount = messageCount
+	a.lastRecallRevision = chatRevision
 	a.mu.Unlock()
 	if len(parts) == 0 {
 		return
@@ -143,7 +177,10 @@ func (a *AgentRuntime) generateStoryRecallQuery() string {
 	if a.llm == nil {
 		return ""
 	}
-	contextText := a.ensureRootContext().RecentQuery(10)
+	if !a.subAgentAllowed("memoryQuery") {
+		return ""
+	}
+	contextText := recentChatContextQuery(a.ensureRootContext().Messages(), 10)
 	if strings.TrimSpace(contextText) == "" {
 		return ""
 	}
@@ -156,20 +193,49 @@ func (a *AgentRuntime) generateStoryRecallQuery() string {
 			"limit": map[string]any{"type": "integer"},
 		}),
 	}
-	completion, err := model.Chat(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), a.subAgentTimeout())
+	defer cancel()
+	completion, err := model.Chat(ctx,
 		"请根据当前对话上下文，调用 search_memory 工具搜索可能相关的历史记忆。只需要给出最适合检索的一句 query。",
 		[]agentruntime.Message{{Role: "user", Content: contextText}},
 		[]agentruntime.ToolDefinition{tool},
 		map[string]any{"tool_name": "search_memory"},
 	)
 	if err != nil || len(completion.Message.ToolCalls) == 0 {
+		a.reportSubAgentResult("memoryQuery", err)
 		return ""
 	}
+	a.reportSubAgentResult("memoryQuery", nil)
 	call := completion.Message.ToolCalls[0]
 	if call.Name != "search_memory" {
 		return ""
 	}
 	return strings.TrimSpace(common.AsString(call.Arguments["query"]))
+}
+
+func recentChatContextQuery(messages []agentruntime.Message, limit int) string {
+	filtered := make([]agentruntime.Message, 0, len(messages))
+	for _, message := range messages {
+		if strings.Contains(message.Content, "<qq_message") || message.Role == "assistant" {
+			filtered = append(filtered, message)
+		}
+	}
+	return recentContextQuery(filtered, limit)
+}
+
+func (a *AgentRuntime) subAgentTimeout() time.Duration {
+	ms := 30000
+	if a.cfg != nil && a.cfg.Server.Agent.SubAgentTimeoutMs > 0 {
+		ms = a.cfg.Server.Agent.SubAgentTimeoutMs
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (a *AgentRuntime) storyLedgerKeepCount() int {
+	if a.cfg != nil && a.cfg.Server.Agent.Story.LedgerKeepCount > 0 {
+		return a.cfg.Server.Agent.Story.LedgerKeepCount
+	}
+	return 1000
 }
 
 func summarizeMessages(messages []agentruntime.Message) string {

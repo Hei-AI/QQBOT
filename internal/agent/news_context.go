@@ -10,14 +10,9 @@ func (a *AgentRuntime) renderNewsArticles(ids any) string {
 	if len(articleIDs) == 0 {
 		return ""
 	}
-	data := a.store.Snapshot()
-	articleByID := map[int]db.NewsArticle{}
-	for _, article := range data.NewsArticles {
-		articleByID[article.ID] = article
-	}
 	summaries := []prompts.ArticleSummary{}
 	for _, id := range articleIDs {
-		if article, ok := articleByID[id]; ok {
+		if article, ok := a.store.FindNewsArticleByID(id); ok {
 			summaries = append(summaries, prompts.ArticleSummary{
 				ID:              article.ID,
 				Title:           article.Title,
@@ -41,10 +36,5 @@ func (a *AgentRuntime) findNewsArticle(id any) (db.NewsArticle, bool) {
 	if articleID == 0 {
 		return db.NewsArticle{}, false
 	}
-	for _, article := range a.store.Snapshot().NewsArticles {
-		if article.ID == articleID {
-			return article, true
-		}
-	}
-	return db.NewsArticle{}, false
+	return a.store.FindNewsArticleByID(articleID)
 }

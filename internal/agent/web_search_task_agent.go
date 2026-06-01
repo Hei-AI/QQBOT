@@ -3,19 +3,30 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"qqbot-ai/internal/agentruntime"
 	"qqbot-ai/internal/capabilities/websearch"
 	"qqbot-ai/internal/common"
 	"qqbot-ai/internal/prompts"
+	"sync"
+	"time"
 )
 
 type WebSearchTaskAgentTool struct {
-	service websearch.Service
-	model   agentruntime.Model
+	service   websearch.Service
+	model     agentruntime.Model
+	timeout   time.Duration
+	mu        sync.Mutex
+	failures  int
+	openUntil time.Time
 }
 
 func NewWebSearchTaskAgentTool(service websearch.Service) *WebSearchTaskAgentTool {
 	return &WebSearchTaskAgentTool{service: service}
+}
+
+func (t *WebSearchTaskAgentTool) SetTimeout(timeout time.Duration) {
+	t.timeout = timeout
 }
 
 func (t *WebSearchTaskAgentTool) SetModel(model agentruntime.Model) {
@@ -29,6 +40,14 @@ func (t *WebSearchTaskAgentTool) Definition() agentruntime.ToolDefinition {
 func (t *WebSearchTaskAgentTool) Kind() string { return "business" }
 
 func (t *WebSearchTaskAgentTool) Execute(ctx context.Context, call agentruntime.ToolCall) (agentruntime.ToolResult, error) {
+	if !t.allowed() {
+		return agentruntime.ToolResult{}, fmt.Errorf("web search agent is temporarily unavailable after repeated failures")
+	}
+	if t.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.timeout)
+		defer cancel()
+	}
 	query := common.AsString(call.Arguments["query"])
 	if query == "" {
 		query = common.AsString(call.Arguments["question"])
@@ -36,8 +55,10 @@ func (t *WebSearchTaskAgentTool) Execute(ctx context.Context, call agentruntime.
 	if t.model == nil {
 		raw, err := websearch.SearchWebRawTool{Service: t.service}.Execute(ctx, agentruntime.ToolCall{ID: call.ID + ":raw", Name: "search_web_raw", Arguments: map[string]any{"query": query, "maxResults": 5}})
 		if err != nil {
+			t.report(err)
 			return raw, err
 		}
+		t.report(nil)
 		return raw, nil
 	}
 
@@ -56,12 +77,14 @@ func (t *WebSearchTaskAgentTool) Execute(ctx context.Context, call agentruntime.
 			ToolChoice:   "auto",
 		})
 		if err != nil {
+			t.report(err)
 			return agentruntime.ToolResult{}, err
 		}
 		last = result
 		messages = append(messages, result.Assistant)
 		for _, execution := range result.ToolExecutions {
 			if execution.Call.Name == "finalize_web_search" {
+				t.report(nil)
 				return agentruntime.ToolResult{Kind: "business", Content: execution.Result.Content}, nil
 			}
 			messages = append(messages, agentruntime.Message{Role: "tool", ToolCallID: execution.Call.ID, Content: execution.Result.Content})
@@ -73,4 +96,25 @@ func (t *WebSearchTaskAgentTool) Execute(ctx context.Context, call agentruntime.
 		content = string(data)
 	}
 	return agentruntime.ToolResult{Kind: "business", Content: content}, nil
+}
+
+func (t *WebSearchTaskAgentTool) allowed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.openUntil.IsZero() || time.Now().After(t.openUntil)
+}
+
+func (t *WebSearchTaskAgentTool) report(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err == nil {
+		t.failures = 0
+		t.openUntil = time.Time{}
+		return
+	}
+	t.failures++
+	if t.failures >= 3 {
+		t.failures = 0
+		t.openUntil = time.Now().Add(2 * time.Minute)
+	}
 }

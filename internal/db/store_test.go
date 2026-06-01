@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -50,5 +51,39 @@ func TestSQLiteStoreRoundTrip(t *testing.T) {
 	}
 	if latest, ok := store.LatestStoryLedger("root"); !ok || latest.Seq != seq {
 		t.Fatalf("LatestStoryLedger() = (%+v, %v), want seq %d", latest, ok, seq)
+	}
+}
+
+func TestStorePrunesProcessedStoryLedgerTail(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i := 0; i < 8; i++ {
+		store.AddStoryLedger("root", "user", fmt.Sprintf("message-%d", i))
+	}
+	store.PruneStoryLedgerThrough("root", 6, 2)
+	items := store.ListStoryLedgerAfter("root", 0, 0)
+	if len(items) != 4 {
+		t.Fatalf("got %d ledger items, want processed tail 2 plus pending 2", len(items))
+	}
+	if items[0].Seq != 5 || items[3].Seq != 8 {
+		t.Fatalf("unexpected ledger tail: %#v", items)
+	}
+}
+
+func TestStoreRecentNapcatMessagesFiltersConversation(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("1"), UserID: StringPtr("u1"), Message: "old"})
+	store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("2"), UserID: StringPtr("u2"), Message: "other"})
+	store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("1"), UserID: StringPtr("u1"), Message: "new"})
+	items := store.RecentNapcatMessages("group", "1", 2)
+	if len(items) != 2 || items[0].Message != "old" || items[1].Message != "new" {
+		t.Fatalf("unexpected recent messages: %#v", items)
 	}
 }

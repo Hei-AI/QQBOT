@@ -13,6 +13,7 @@ import (
 	"qqbot-ai/internal/config"
 	"qqbot-ai/internal/db"
 	"strings"
+	"time"
 )
 
 func buildBusinessTools(cfg *config.Config, store *db.Store, sender messaging.Sender, webSearch websearch.Service, webSearchModel agentruntime.Model, terminalService *terminal.Service) *agentruntime.ToolCatalog {
@@ -20,6 +21,9 @@ func buildBusinessTools(cfg *config.Config, store *db.Store, sender messaging.Se
 	recall := storycap.NewVectorRecall(cfg, store)
 	storyService := storycap.Service{Repo: storeStoryRepository{store: store, indexer: indexer}, Recall: recall}
 	searchTool := NewWebSearchTaskAgentTool(webSearch)
+	if cfg.Server.Agent.SubAgentTimeoutMs > 0 {
+		searchTool.SetTimeout(time.Duration(cfg.Server.Agent.SubAgentTimeoutMs) * time.Millisecond)
+	}
 	catalog := agentruntime.NewToolCatalog(
 		sendMessageTool{sender: sender},
 		searchTool,
@@ -120,7 +124,7 @@ func (r storeStoryRepository) Save(ctx context.Context, story storycap.Story) er
 }
 
 func (r storeStoryRepository) List(context.Context) ([]storycap.Story, error) {
-	items := r.store.Snapshot().Stories
+	items := r.store.ListStories()
 	out := make([]storycap.Story, 0, len(items))
 	for _, item := range items {
 		out = append(out, storycap.Story{
@@ -153,22 +157,21 @@ type storeNewsStore struct {
 }
 
 func (s storeNewsStore) FindArticle(id int) (news.Article, bool) {
-	for _, article := range s.store.Snapshot().NewsArticles {
-		if article.ID == id {
-			content := article.Content
-			source := "article_content"
-			if content == "" {
-				content = article.RSSSummary
-				source = "rss_summary"
-			}
-			truncated := false
-			maxChars := s.maxChars
-			if maxChars > 0 && len([]rune(content)) > maxChars {
-				content = string([]rune(content)[:maxChars])
-				truncated = true
-			}
-			return news.Article{ID: article.ID, Title: article.Title, URL: article.URL, PublishedAt: article.PublishedAt.Format("2006-01-02 15:04"), Content: content, ContentSource: source, Truncated: truncated, MaxChars: maxChars}, true
-		}
+	article, ok := s.store.FindNewsArticleByID(id)
+	if !ok {
+		return news.Article{}, false
 	}
-	return news.Article{}, false
+	content := article.Content
+	source := "article_content"
+	if content == "" {
+		content = article.RSSSummary
+		source = "rss_summary"
+	}
+	truncated := false
+	maxChars := s.maxChars
+	if maxChars > 0 && len([]rune(content)) > maxChars {
+		content = string([]rune(content)[:maxChars])
+		truncated = true
+	}
+	return news.Article{ID: article.ID, Title: article.Title, URL: article.URL, PublishedAt: article.PublishedAt.Format("2006-01-02 15:04"), Content: content, ContentSource: source, Truncated: truncated, MaxChars: maxChars}, true
 }

@@ -60,6 +60,9 @@ func (a *AgentRuntime) summarizeMessagesWithLLM(messages []agentruntime.Message)
 	if a.llm == nil || len(messages) == 0 {
 		return fallback
 	}
+	if !a.subAgentAllowed("contextSummarizer") {
+		return fallback
+	}
 	body := []string{}
 	for _, msg := range messages {
 		if strings.TrimSpace(msg.Content) == "" {
@@ -71,14 +74,18 @@ func (a *AgentRuntime) summarizeMessagesWithLLM(messages []agentruntime.Message)
 		return fallback
 	}
 	model := llmModelAdapter{client: a.llm, usage: "contextSummarizer"}
-	completion, err := model.Chat(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), a.subAgentTimeout())
+	defer cancel()
+	completion, err := model.Chat(ctx,
 		"你是上下文压缩器。请把输入压缩成供同一个 QQ 群聊 Agent 稍后继续使用的中文工作记忆，保留长期背景、当前话题、已执行动作和后续可接的点。只输出摘要。",
 		[]agentruntime.Message{{Role: "user", Content: strings.Join(body, "\n\n")}},
 		nil,
 		"none",
 	)
 	if err != nil || strings.TrimSpace(completion.Message.Content) == "" {
+		a.reportSubAgentResult("contextSummarizer", err)
 		return fallback
 	}
+	a.reportSubAgentResult("contextSummarizer", nil)
 	return strings.TrimSpace(completion.Message.Content)
 }

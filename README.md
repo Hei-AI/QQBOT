@@ -121,8 +121,10 @@ http://localhost:20003
 2. 将 NapCat 消息、wake、跨状态通知等渲染成上下文。
 3. 必要时触发 Root Agent 调用。
 4. Root Agent 只能通过工具行动：`enter`、`back`、`wait`、`invoke` 等。
-5. 成功发送消息、进入状态或等待后，当前轮结束，回到事件驱动等待。
-6. 群聊/私聊消息会同步进入 Story ledger，Story Agent 按 batch 或 idle flush 处理长期记忆。
+5. 连续到达的聊天消息会短暂聚合成 burst，再交给 Root Agent 判断，避免逐条抢话。
+6. 发送前会检查近期自己的发言和近似重复，连续复读会被压下。
+7. 成功发送消息、进入状态或等待后，当前轮结束，回到事件驱动等待。
+8. 群聊/私聊消息会同步进入 Story ledger，Story Agent 按 batch 或 idle flush 处理长期记忆。
 
 这套设计的目标是避免“定时空转式聊天”。没有新事件、没有自然切口时，模型应该选择 `wait`。
 
@@ -143,8 +145,12 @@ http://localhost:20003
 - `server.agent.llmRetryBackoffMs`：LLM 调用失败后的重试等待。
 - `server.agent.waitToolMaxWaitMs`：模型请求等待时的最大等待时间。
 - `server.agent.notificationBatchWindowMs`：跨状态通知聚合窗口。
+- `server.agent.eventBurstQuietMs` / `eventBurstMaxWaitMs`：连续聊天消息聚合窗口。
+- `server.agent.groupReplyCooldownMs`：普通群聊回复的基础冷却时间。
+- `server.agent.subAgentTimeoutMs`：Story、召回查询和网页检索子 Agent 超时。
 - `server.agent.story.batchSize`：Story Agent 单批处理消息数。
 - `server.agent.story.idleFlushMs`：Story Agent 空闲 flush 时间。
+- `server.agent.story.ledgerKeepCount`：已处理 Story ledger 保留尾巴长度。
 - `server.agent.story.memory.embedding`：Story embedding provider 配置。
 - `server.agent.story.recall.topK`：`search_memory` 返回的 Story 数。
 - `server.agent.story.recall.scoreThreshold`：向量召回最低相似度。

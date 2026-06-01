@@ -53,9 +53,16 @@ type AgentRuntime struct {
 	lastTotalTokens                  int
 	storyLastSeq                     int
 	lastRecallCount                  int
+	chatRevision                     int
+	lastRecallRevision               int
 	recalledStoryIDs                 map[string]bool
 	lastWakeReminderAt               *time.Time
 	lastSentAtByTarget               map[string]time.Time
+	sentChatHistory                  []sentChatMessage
+	socialParticipants               map[string]socialParticipant
+	recentTopicsByTarget             map[string][]string
+	subAgentFailures                 map[string]int
+	subAgentOpenUntil                map[string]time.Time
 	lastPersistedSnapshotFingerprint string
 	ctx                              context.Context
 }
@@ -91,22 +98,26 @@ func NewAgentRuntime(cfg *config.Config, store *db.Store, events *EventQueue, ll
 	}
 	session := newRootSession(cfg, store, terminalService != nil, recentProvider)
 	return &AgentRuntime{
-		cfg:                cfg,
-		store:              store,
-		events:             events,
-		llm:                llmClient,
-		sender:             sender,
-		rootKernel:         agentruntime.ReActKernel{Model: rootModel},
-		storyKernel:        agentruntime.ReActKernel{Model: storyModel},
-		hooks:              RuntimeHookSet{},
-		rootTools:          buildBusinessTools(cfg, store, sender, searchService, webSearchModel, terminalService),
-		storyTools:         buildStoryTools(cfg, store),
-		session:            session,
-		terminal:           terminalService,
-		storyQueue:         make(chan agentruntime.Message, cfg.Server.Agent.Story.BatchSize*2),
-		recalledStoryIDs:   map[string]bool{},
-		lastSentAtByTarget: map[string]time.Time{},
-		loopState:          "starting",
+		cfg:                  cfg,
+		store:                store,
+		events:               events,
+		llm:                  llmClient,
+		sender:               sender,
+		rootKernel:           agentruntime.ReActKernel{Model: rootModel},
+		storyKernel:          agentruntime.ReActKernel{Model: storyModel},
+		hooks:                RuntimeHookSet{},
+		rootTools:            buildBusinessTools(cfg, store, sender, searchService, webSearchModel, terminalService),
+		storyTools:           buildStoryTools(cfg, store),
+		session:              session,
+		terminal:             terminalService,
+		storyQueue:           make(chan agentruntime.Message, cfg.Server.Agent.Story.BatchSize*2),
+		recalledStoryIDs:     map[string]bool{},
+		lastSentAtByTarget:   map[string]time.Time{},
+		socialParticipants:   map[string]socialParticipant{},
+		recentTopicsByTarget: map[string][]string{},
+		subAgentFailures:     map[string]int{},
+		subAgentOpenUntil:    map[string]time.Time{},
+		loopState:            "starting",
 	}
 }
 
@@ -123,8 +134,19 @@ func (a *AgentRuntime) Start(ctx context.Context) {
 		a.storyMessages = snapshot.StoryMessages
 		a.storyLastSeq = snapshot.StoryLastSeq
 		a.lastRecallCount = snapshot.LastRecallCount
+		a.chatRevision = snapshot.ChatRevision
+		a.lastRecallRevision = snapshot.LastRecallRevision
 		if snapshot.RecalledStoryIDs != nil {
 			a.recalledStoryIDs = cloneBoolMap(snapshot.RecalledStoryIDs)
+		}
+		a.sentChatHistory = append([]sentChatMessage(nil), snapshot.SentChatHistory...)
+		a.socialParticipants = cloneSocialParticipants(snapshot.SocialParticipants)
+		a.recentTopicsByTarget = cloneStringSlices(snapshot.RecentTopicsByTarget)
+		for _, sent := range a.sentChatHistory {
+			key := targetKey(sent.Target)
+			if a.lastSentAtByTarget[key].Before(sent.CreatedAt) {
+				a.lastSentAtByTarget[key] = sent.CreatedAt
+			}
 		}
 		a.session.restore(snapshot.Session)
 	}
@@ -218,6 +240,13 @@ func (a *AgentRuntime) recordSentMessage(execution agentruntime.ToolExecution) {
 		a.lastSentAtByTarget = map[string]time.Time{}
 	}
 	a.lastSentAtByTarget[targetKey(target)] = time.Now()
+	message := strings.TrimSpace(common.AsString(invokeArguments(execution.Call)["message"]))
+	if message != "" {
+		a.sentChatHistory = append(a.sentChatHistory, sentChatMessage{Target: target, Message: message, CreatedAt: time.Now()})
+		if len(a.sentChatHistory) > 80 {
+			a.sentChatHistory = a.sentChatHistory[len(a.sentChatHistory)-80:]
+		}
+	}
 	a.mu.Unlock()
 }
 

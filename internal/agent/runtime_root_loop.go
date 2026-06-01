@@ -51,14 +51,16 @@ func (a *AgentRuntime) consumeEvents() bool {
 	a.mu.Lock()
 	a.loopState = "consuming_events"
 	a.mu.Unlock()
-	events := a.events.DequeueAll()
+	events := coalesceAndPrioritizeEvents(a.events.DequeueBurst(a.runtimeContext(), a.eventBurstQuiet(), a.eventBurstMaxWait()))
 	if len(events) > 0 {
 		log.Printf("[AGENT] consume events count=%d", len(events))
 	}
 	shouldRunRoot := false
 	var storyBatch []agentruntime.Message
 	var replyTarget *chatReplyTarget
+	forceNotificationFlush := false
 	for _, event := range events {
+		a.observeChatEvent(event)
 		eventContext := a.renderEventContext(event)
 		rendered, visible, shouldTrigger := a.session.consume(event, eventContext)
 		log.Printf("[AGENT] event type=%s target=%+v preview=%q", event.Type, targetFromEvent(event), trimPreview(rendered, 300))
@@ -71,7 +73,13 @@ func (a *AgentRuntime) consumeEvents() bool {
 		if shouldTrigger && a.eventShouldTriggerRoot(event) {
 			shouldRunRoot = true
 		}
+		if event.Type == "napcat_private_message" || a.isPriorityMessage(event) {
+			forceNotificationFlush = true
+		}
 		if (event.Type == "napcat_group_message" || event.Type == "napcat_private_message") && !boolValue(event.Data["startup"]) {
+			a.mu.Lock()
+			a.chatRevision++
+			a.mu.Unlock()
 			storyBatch = append(storyBatch, agentruntime.Message{Role: "user", Content: eventContext})
 			a.store.AddStoryLedger("root", "user", eventContext)
 			if target := targetFromEvent(event); target.ID != "" {
@@ -79,7 +87,7 @@ func (a *AgentRuntime) consumeEvents() bool {
 			}
 		}
 	}
-	if notification := a.session.flushNotificationsIfReady(a.notificationBatchWindow()); notification != "" {
+	if notification := a.session.flushNotificationsIfReady(a.notificationBatchWindow(), forceNotificationFlush); notification != "" {
 		a.appendRootContext(RootContextLayerEvent, agentruntime.Message{Role: "user", Content: notification})
 		a.appendContext(contextItem("system_reminder", "cross_state_notification", notification))
 		shouldRunRoot = true
@@ -123,6 +131,29 @@ func (a *AgentRuntime) notificationBatchWindow() time.Duration {
 		ms = a.cfg.Server.Agent.NotificationBatchWindowMs
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func (a *AgentRuntime) eventBurstQuiet() time.Duration {
+	ms := 1200
+	if a.cfg != nil && a.cfg.Server.Agent.EventBurstQuietMs > 0 {
+		ms = a.cfg.Server.Agent.EventBurstQuietMs
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (a *AgentRuntime) eventBurstMaxWait() time.Duration {
+	ms := 3000
+	if a.cfg != nil && a.cfg.Server.Agent.EventBurstMaxWaitMs > 0 {
+		ms = a.cfg.Server.Agent.EventBurstMaxWaitMs
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (a *AgentRuntime) runtimeContext() context.Context {
+	if a.ctx != nil {
+		return a.ctx
+	}
+	return context.Background()
 }
 
 func (a *AgentRuntime) eventShouldTriggerRoot(event AgentEvent) bool {
@@ -186,7 +217,11 @@ func (a *AgentRuntime) isPriorityMessage(event AgentEvent) bool {
 }
 
 func (a *AgentRuntime) groupReplyCooldown() time.Duration {
-	return 20 * time.Second
+	ms := 20000
+	if a.cfg != nil && a.cfg.Server.Agent.GroupReplyCooldownMs > 0 {
+		ms = a.cfg.Server.Agent.GroupReplyCooldownMs
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (a *AgentRuntime) runRootRound(ctx context.Context) rootRoundDisposition {
@@ -199,6 +234,7 @@ func (a *AgentRuntime) runRootRound(ctx context.Context) rootRoundDisposition {
 	a.sanitizeRootContext()
 	a.compactRootContextIfNeeded()
 	a.injectStoryRecallIfNeeded()
+	a.appendSocialContextIfUseful()
 	a.hooks.OnBeforeRootRound(ctx, a)
 	tools := a.rootControlTools()
 	messages := a.rootPromptMessages()

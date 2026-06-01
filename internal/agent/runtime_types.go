@@ -100,12 +100,23 @@ type chatReplyTarget struct {
 	ID   string
 }
 
+type sentChatMessage struct {
+	Target    chatReplyTarget
+	Message   string
+	CreatedAt time.Time
+}
+
 type agentRuntimeSnapshot struct {
-	RootMessages     []agentruntime.Message `json:"rootMessages"`
-	StoryMessages    []agentruntime.Message `json:"storyMessages"`
-	StoryLastSeq     int                    `json:"storyLastSeq"`
-	LastRecallCount  int                    `json:"lastRecallCount"`
-	RecalledStoryIDs map[string]bool        `json:"recalledStoryIds"`
-	Session          rootSessionSnapshot    `json:"session"`
-	UpdatedAt        time.Time              `json:"updatedAt"`
+	RootMessages         []agentruntime.Message       `json:"rootMessages"`
+	StoryMessages        []agentruntime.Message       `json:"storyMessages"`
+	StoryLastSeq         int                          `json:"storyLastSeq"`
+	LastRecallCount      int                          `json:"lastRecallCount"`
+	ChatRevision         int                          `json:"chatRevision"`
+	LastRecallRevision   int                          `json:"lastRecallRevision"`
+	RecalledStoryIDs     map[string]bool              `json:"recalledStoryIds"`
+	SentChatHistory      []sentChatMessage            `json:"sentChatHistory"`
+	SocialParticipants   map[string]socialParticipant `json:"socialParticipants"`
+	RecentTopicsByTarget map[string][]string          `json:"recentTopicsByTarget"`
+	Session              rootSessionSnapshot          `json:"session"`
+	UpdatedAt            time.Time                    `json:"updatedAt"`
 }
