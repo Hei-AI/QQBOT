@@ -3,10 +3,179 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>QQBOT Console</title>
-    <meta http-equiv="refresh" content="0; url=http://localhost:20003/" />
+    <title>Kagami Go Console</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f6f8;
+        --panel: #ffffff;
+        --line: #d9dee7;
+        --text: #172033;
+        --muted: #667085;
+        --brand: #1f7a6d;
+        --accent: #9a5b13;
+        --bad: #b42318;
+        --ok: #16703d;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .app { min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
+      nav { position: sticky; top: 0; height: 100vh; border-right: 1px solid var(--line); background: #fbfcfd; padding: 18px 14px; overflow: auto; }
+      .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; margin: 0 8px 18px; }
+      .mark { width: 26px; height: 26px; border-radius: 6px; background: linear-gradient(135deg, var(--brand), #2f5fb3); }
+      .nav-group { margin-top: 16px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 0 8px; }
+      .nav-btn { width: 100%; display: flex; align-items: center; gap: 10px; border: 0; background: transparent; color: var(--text); text-align: left; padding: 10px 8px; border-radius: 6px; cursor: pointer; }
+      .nav-btn:hover, .nav-btn.active { background: #e9f3f1; color: #0e5f54; }
+      main { min-width: 0; padding: 22px; }
+      .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
+      h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
+      .sub { color: var(--muted); margin-top: 2px; }
+      button, input, select, textarea { font: inherit; }
+      button.primary, button.secondary, .icon-btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; padding: 8px 11px; cursor: pointer; }
+      button.primary { background: var(--brand); border-color: var(--brand); color: white; }
+      button.secondary:hover, .icon-btn:hover { border-color: #9fb0c7; }
+      .grid { display: grid; gap: 14px; }
+      .grid.cols { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+      .span-4 { grid-column: span 4; }
+      .span-6 { grid-column: span 6; }
+      .span-8 { grid-column: span 8; }
+      .span-12 { grid-column: span 12; }
+      .panel h2 { margin: 0 0 10px; font-size: 15px; }
+      .kpi { font-size: 28px; font-weight: 700; }
+      .muted { color: var(--muted); }
+      .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .field { display: grid; gap: 5px; }
+      input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 6px; background: white; padding: 8px 10px; color: var(--text); }
+      textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+      table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+      th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+      th { color: var(--muted); font-size: 12px; font-weight: 600; }
+      pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .pill { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; color: var(--muted); background: #fafafa; }
+      .ok { color: var(--ok); }
+      .bad { color: var(--bad); }
+      .hidden { display: none; }
+      @media (max-width: 900px) {
+        .app { grid-template-columns: 1fr; }
+        nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+        .nav-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+        main { padding: 14px; }
+        .span-4, .span-6, .span-8 { grid-column: span 12; }
+      }
+    </style>
   </head>
   <body>
-    <p>正在打开 <a href="http://localhost:20003/">QQBOT Console</a>。</p>
+    <div class="app">
+      <nav>
+        <div class="brand"><span class="mark"></span><span>Kagami Go</span></div>
+        <div class="nav-list" id="nav"></div>
+      </nav>
+      <main>
+        <div class="topbar">
+          <div>
+            <h1 id="title">Agent 仪表盘</h1>
+            <div class="sub" id="subtitle">Root / Story / Scheduler 运行状态</div>
+          </div>
+          <button class="secondary" id="refresh">刷新</button>
+        </div>
+        <div id="view" class="grid"></div>
+      </main>
+    </div>
+    <script>
+      const pages = [
+        ["agent", "Agent 仪表盘", "Root / Story / Scheduler 运行状态"],
+        ["auth", "内置登录", "Codex 与 Claude Code OAuth 状态"],
+        ["playground", "LLM Playground", "直接调用 Go 后端 LLM API"],
+        ["metrics", "Metric 图表", "指标图表定义与数据"],
+        ["llm", "LLM 调用历史", "最近模型请求与响应"],
+        ["logs", "应用日志", "运行日志与 trace"],
+        ["events", "NapCat 事件", "原始事件历史"],
+        ["messages", "QQ 消息", "标准化消息与 segments"],
+        ["stories", "Story 记忆", "长期叙事记忆"],
+      ];
+      const state = { page: location.hash.slice(1) || "agent" };
+      const $ = id => document.getElementById(id);
+      const json = value => JSON.stringify(value, null, 2);
+      async function api(url, options) {
+        const res = await fetch(url, options);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || res.statusText);
+        return data;
+      }
+      function setHTML(html) { $("view").innerHTML = html; }
+      function esc(value) {
+        return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+      }
+      function table(items, columns) {
+        if (!items || items.length === 0) return '<div class="muted">暂无数据</div>';
+        return `<table><thead><tr>${columns.map(c => `<th>${esc(c[0])}</th>`).join("")}</tr></thead><tbody>${items.map(item => `<tr>${columns.map(c => `<td>${c[1](item)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+      }
+      function renderNav() {
+        $("nav").innerHTML = pages.map(([id, label], index) => `${index === 0 || index === 3 || index === 5 ? `<div class="nav-group">${index === 0 ? "运行" : index === 3 ? "观测" : "数据"}</div>` : ""}<button class="nav-btn ${state.page === id ? "active" : ""}" data-page="${id}">${label}</button>`).join("");
+        document.querySelectorAll(".nav-btn").forEach(btn => btn.onclick = () => { state.page = btn.dataset.page; location.hash = state.page; render(); });
+      }
+      async function renderAgent() {
+        const [dash, tasks] = await Promise.all([api("/agent-dashboard/current"), api("/scheduler/tasks")]);
+        const root = dash.agents?.[0] || {};
+        const story = dash.agents?.[1] || {};
+        setHTML(`<div class="grid cols">
+          <section class="panel span-4"><h2>Root 状态</h2><div class="kpi">${esc(root.runtime?.loopState || "-")}</div><div class="muted">队列 ${esc(root.queue?.pendingEventCount ?? 0)} · 上次活动 ${esc(root.runtime?.lastActivityAt || "-")}</div><div class="row" style="margin-top:10px"><button class="secondary" onclick="resetAgentState()">重置持久态</button></div></section>
+          <section class="panel span-4"><h2>当前空间</h2><div class="kpi">${esc(root.session?.focusedStateDisplayName || "-")}</div><div class="muted">${esc(root.session?.focusedStateDescription || "")}</div></section>
+          <section class="panel span-4"><h2>Story</h2><div class="kpi">${esc(story.story?.lastProcessedMessageSeq ?? 0)}</div><div class="muted">batch ${esc(story.story?.batchSize ?? "-")} · context ${esc(story.context?.messageCount ?? 0)}</div></section>
+          <section class="panel span-6"><h2>子状态</h2>${table(root.session?.children || [], [["名称", x => esc(x.displayName)], ["ID", x => `<span class="pill">${esc(x.id)}</span>`], ["描述", x => esc(x.description)]])}</section>
+          <section class="panel span-6"><h2>Scheduler</h2>${table(tasks.tasks || [], [["任务", x => esc(x.name)], ["状态", x => esc(x.status)], ["下次运行", x => esc(x.nextRunAt || "-")], ["操作", x => `<button class="secondary" onclick="triggerTask('${esc(encodeURIComponent(x.name))}')">触发</button>`]])}</section>
+          <section class="panel span-12"><h2>最近上下文</h2>${table(root.context?.recentItems || [], [["类型", x => esc(x.kind)], ["标签", x => esc(x.label)], ["内容", x => `<pre>${esc(x.preview)}</pre>`]])}</section>
+        </div>`);
+      }
+      async function triggerTask(name) { await api(`/scheduler/tasks/${name}/trigger`, { method: "POST" }); render(); }
+      async function resetAgentState() { await api("/agent-dashboard/reset-persisted-state", { method: "POST" }); render(); }
+      async function renderAuth() {
+        const providers = ["codex", "claude-code"];
+        const rows = await Promise.all(providers.map(async p => ({ p, status: await api(`/auth/${p}/status`), usage: await api(`/auth/${p}/usage-limits`).catch(e => ({ error: e.message })) })));
+        setHTML(`<div class="grid cols">${rows.map(row => `<section class="panel span-6"><h2>${row.p}</h2><pre>${esc(json(row.status))}</pre><div class="row" style="margin:10px 0"><button class="primary" onclick="login('${row.p}')">登录</button><button class="secondary" onclick="refreshAuth('${row.p}')">刷新</button><button class="secondary" onclick="logout('${row.p}')">退出</button></div><pre>${esc(json(row.usage))}</pre></section>`).join("")}</div>`);
+      }
+      async function login(provider) { const data = await api(`/auth/${provider}/login-url`, { method: "POST" }); if (data.url) location.href = data.url; }
+      async function refreshAuth(provider) { await api(`/auth/${provider}/refresh`, { method: "POST" }); render(); }
+      async function logout(provider) { await api(`/auth/${provider}/logout`, { method: "POST" }); render(); }
+      async function renderPlayground() {
+        const providers = await api("/llm/providers");
+        setHTML(`<div class="grid cols"><section class="panel span-6"><h2>请求</h2><div class="field"><label>System</label><textarea id="sys">你是一个简洁的中文助手。</textarea></div><div class="field"><label>Message</label><textarea id="msg">你好</textarea></div><button class="primary" onclick="chat()">发送</button></section><section class="panel span-6"><h2>Providers</h2><pre>${esc(json(providers))}</pre><h2>响应</h2><pre id="chatResult">等待发送</pre></section></div>`);
+      }
+      async function chat() {
+        const body = { system: $("sys").value, messages: [{ role: "user", content: $("msg").value }], tools: [] };
+        $("chatResult").textContent = json(await api("/llm/chat", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+      }
+      async function renderMetrics() {
+        const charts = await api("/metric-chart/list");
+        setHTML(`<section class="panel"><h2>图表</h2>${table(charts.items || charts || [], [["名称", x => esc(x.chartName)], ["Metric", x => esc(x.metricName)], ["聚合", x => esc(x.aggregator)], ["操作", x => `<button class="secondary" onclick="metricData('${esc(x.chartName)}')">查看数据</button>`]])}</section><section class="panel"><h2>数据</h2><pre id="metricData">选择图表</pre></section>`);
+      }
+      async function metricData(name) { $("metricData").textContent = json(await api(`/metric-chart/data?chartName=${encodeURIComponent(name)}&rangePreset=24h&bucket=hour`)); }
+      async function renderQuery(title, url, columns) {
+        const data = await api(`${url}?page=1&pageSize=50`);
+        setHTML(`<section class="panel"><h2>${title}</h2>${table(data.items || [], columns)}</section>`);
+      }
+      async function render() {
+        const meta = pages.find(p => p[0] === state.page) || pages[0];
+        $("title").textContent = meta[1]; $("subtitle").textContent = meta[2]; renderNav();
+        try {
+          if (state.page === "agent") return renderAgent();
+          if (state.page === "auth") return renderAuth();
+          if (state.page === "playground") return renderPlayground();
+          if (state.page === "metrics") return renderMetrics();
+          if (state.page === "llm") return renderQuery("LLM 调用历史", "/llm-chat-call/query", [["时间", x => esc(x.createdAt)], ["Provider", x => esc(x.provider)], ["Model", x => esc(x.model)], ["状态", x => esc(x.status)], ["详情", x => `<pre>${esc(json(x).slice(0, 1200))}</pre>`]]);
+          if (state.page === "logs") return renderQuery("应用日志", "/app-log/query", [["时间", x => esc(x.createdAt)], ["级别", x => esc(x.level)], ["消息", x => esc(x.message)], ["Metadata", x => `<pre>${esc(json(x.metadata))}</pre>`]]);
+          if (state.page === "events") return renderQuery("NapCat 事件", "/napcat-event/query", [["时间", x => esc(x.createdAt)], ["Post", x => esc(x.postType)], ["Message", x => esc(x.messageType)], ["Payload", x => `<pre>${esc(json(x.payload).slice(0, 1200))}</pre>`]]);
+          if (state.page === "messages") return renderQuery("QQ 消息", "/napcat-group-message/query", [["时间", x => esc(x.createdAt)], ["类型", x => esc(x.messageType)], ["发送者", x => esc(x.nickname || x.userId)], ["内容", x => `<pre>${esc(x.rawMessage || x.payload?.raw_message || "")}</pre>`], ["Segments", x => `<pre>${esc(json(x.messageSegments || []))}</pre>`]]);
+          if (state.page === "stories") return renderQuery("Story 记忆", "/story/query", [["更新时间", x => esc(x.updatedAt)], ["标题", x => esc(x.title)], ["场景", x => esc(x.scene)], ["内容", x => `<pre>${esc((x.markdown || "").slice(0, 1200))}</pre>`]]);
+        } catch (error) {
+          setHTML(`<section class="panel"><h2>加载失败</h2><pre>${esc(error.message)}</pre></section>`);
+        }
+      }
+      window.addEventListener("hashchange", () => { state.page = location.hash.slice(1) || "agent"; render(); });
+      $("refresh").onclick = render;
+      window.triggerTask = triggerTask; window.resetAgentState = resetAgentState; window.login = login; window.refreshAuth = refreshAuth; window.logout = logout; window.chat = chat; window.metricData = metricData;
+      render();
+    </script>
   </body>
 </html>

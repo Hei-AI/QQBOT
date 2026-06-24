@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"qqbot-ai/internal/agentruntime"
+	"QqBot/internal/agentruntime"
 )
 
 // BashTool 将终端命令执行暴露为 Agent 工具。

@@ -181,6 +181,7 @@
           <button data-view="events">NapCat 事件</button>
           <button data-view="stories">Story</button>
           <button data-view="metrics">指标</button>
+          <button data-view="runtime">运行管理</button>
           <button data-view="tools">操作台</button>
         </nav>
       </aside>
@@ -287,6 +288,26 @@
             </div>
           </section>
 
+          <section class="view" id="view-runtime">
+            <div class="grid cols-2">
+              <section class="panel">
+                <div class="panel-head"><h2>调度任务</h2><button id="refresh-scheduler">刷新</button></div>
+                <div id="scheduler-result"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><h2>认证与额度</h2><button id="refresh-auth">刷新</button></div>
+                <pre class="panel-body json" id="auth-result">loading...</pre>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><h2>运行状态维护</h2></div>
+                <div class="panel-body">
+                  <p class="subtle">清除 Root/Story 上下文快照和会话状态，服务会从门户重新开始。</p>
+                  <button class="danger" id="reset-agent-state">重置 Agent 持久状态</button>
+                </div>
+              </section>
+            </div>
+          </section>
+
           <section class="view" id="view-tools">
             <div class="grid cols-2">
               <section class="panel">
@@ -336,6 +357,7 @@
         events: ["NapCat 事件", "原始 WebSocket 事件"],
         stories: ["Story", "长期叙事记忆"],
         metrics: ["指标", "运行时指标图表"],
+        runtime: ["运行管理", "调度、认证和 Agent 状态维护"],
         tools: ["操作台", "手动发送和 LLM 调试"]
       };
       const state = { active: "overview", pages: {} };
@@ -442,7 +464,33 @@
         const query = params({ chartName, rangePreset: $("metric-range").value, bucket: $("metric-bucket").value });
         $("metric-data").textContent = json(await request("/metric-chart/data?" + query));
       }
-      const loaders = { overview: loadOverview, messages: loadMessages, "llm-calls": loadLlmCalls, logs: loadLogs, events: loadEvents, stories: loadStories, metrics: loadMetricList };
+      async function loadScheduler() {
+        const data = await request("/scheduler/tasks");
+        const tasks = data.tasks || [];
+        table("scheduler-result", ["任务", "状态", "下次运行", "最近运行", "操作"], tasks.map(task => [
+          `<strong>${esc(task.name || task.taskName || "")}</strong>`,
+          badge(task.isRunning ? "running" : "idle"),
+          esc(time(task.nextRunAt)),
+          esc(time(task.recentRuns?.[task.recentRuns.length - 1]?.finishedAt || task.recentRuns?.[task.recentRuns.length - 1]?.startedAt)),
+          `<button data-trigger-task="${esc(task.name || task.taskName || "")}">立即触发</button>`
+        ]));
+      }
+      async function loadAuth() {
+        const providers = ["codex", "claude-code"];
+        const result = {};
+        for (const provider of providers) {
+          const [status, limits] = await Promise.all([
+            request(`/auth/${provider}/status`).catch(error => ({ error: error.message })),
+            request(`/auth/${provider}/usage-limits`).catch(error => ({ error: error.message }))
+          ]);
+          result[provider] = { status, usageLimits: limits };
+        }
+        $("auth-result").textContent = json(result);
+      }
+      async function loadRuntime() {
+        await Promise.all([loadScheduler(), loadAuth()]);
+      }
+      const loaders = { overview: loadOverview, messages: loadMessages, "llm-calls": loadLlmCalls, logs: loadLogs, events: loadEvents, stories: loadStories, metrics: loadMetricList, runtime: loadRuntime };
 
       async function load(name = state.active) {
         try {
@@ -467,6 +515,26 @@
       $("refresh").addEventListener("click", () => load());
       document.querySelectorAll("[data-load]").forEach(button => button.addEventListener("click", () => load(button.dataset.load)));
       $("refresh-metric-list").addEventListener("click", loadMetricList);
+      $("refresh-scheduler").addEventListener("click", () => loadScheduler().catch(error => notice(error.message, true)));
+      $("refresh-auth").addEventListener("click", () => loadAuth().catch(error => notice(error.message, true)));
+      $("scheduler-result").addEventListener("click", async event => {
+        const button = event.target.closest("button[data-trigger-task]");
+        if (!button) return;
+        try {
+          const name = button.dataset.triggerTask;
+          await request(`/scheduler/tasks/${encodeURIComponent(name)}/trigger`, { method: "POST" });
+          notice(`任务 ${name} 已触发`);
+          await loadScheduler();
+        } catch (error) { notice(error.message, true); }
+      });
+      $("reset-agent-state").addEventListener("click", async () => {
+        if (!confirm("确定清除 Agent 持久上下文和会话状态吗？")) return;
+        try {
+          await request("/agent-dashboard/reset-persisted-state", { method: "POST" });
+          notice("Agent 持久状态已重置");
+          await loadOverview();
+        } catch (error) { notice(error.message, true); }
+      });
       $("metric-form").addEventListener("submit", async event => {
         event.preventDefault();
         const body = { chartName: $("metric-create-chart").value.trim(), metricName: $("metric-create-name").value.trim(), aggregator: $("metric-create-aggregator").value, groupByTag: $("metric-create-group").value.trim() };

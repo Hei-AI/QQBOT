@@ -1,0 +1,13 @@
+{
+  "name": "qq-bot-cloakbrowser-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.3.31",
+    "playwright-core": "^1.52.0"
+  }
+}

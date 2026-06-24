@@ -6,7 +6,8 @@ import (
 )
 
 // EventQueue 是带一次性等待者的内存 FIFO 队列。
-// 供 root/story Agent 使用，
+//
+// 它对应 TypeScript 的 InMemoryEventQueue，供 root/story Agent 使用，
 // 例如在 wait 工具中阻塞等待 NapCat、新闻或定时器事件到达。
 type EventQueue[T any] struct {
 	mu      sync.Mutex

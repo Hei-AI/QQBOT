@@ -1,35 +1,79 @@
 package agent
 
 import (
+	"QqBot/internal/agentruntime"
+	browsercap "QqBot/internal/capabilities/browser"
+	"QqBot/internal/capabilities/magnetsearch"
+	"QqBot/internal/capabilities/messaging"
+	"QqBot/internal/capabilities/news"
+	storycap "QqBot/internal/capabilities/story"
+	"QqBot/internal/capabilities/terminal"
+	"QqBot/internal/capabilities/vision"
+	"QqBot/internal/capabilities/websearch"
+	"QqBot/internal/config"
+	"QqBot/internal/db"
+	"QqBot/internal/llm"
 	"context"
 	"encoding/json"
 	"fmt"
-	"qqbot-ai/internal/agentruntime"
-	"qqbot-ai/internal/capabilities/messaging"
-	"qqbot-ai/internal/capabilities/news"
-	storycap "qqbot-ai/internal/capabilities/story"
-	"qqbot-ai/internal/capabilities/terminal"
-	"qqbot-ai/internal/capabilities/websearch"
-	"qqbot-ai/internal/config"
-	"qqbot-ai/internal/db"
+	"math"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-func buildBusinessTools(cfg *config.Config, store *db.Store, sender messaging.Sender, webSearch websearch.Service, webSearchModel agentruntime.Model, terminalService *terminal.Service) *agentruntime.ToolCatalog {
+func buildBusinessTools(cfg *config.Config, store *db.Store, sender messaging.Sender, terminalService *terminal.Service, llmClient *llm.LLMClient) *agentruntime.ToolCatalog {
 	indexer := storycap.NewMemoryIndexer(cfg, store)
 	recall := storycap.NewVectorRecall(cfg, store)
 	storyService := storycap.Service{Repo: storeStoryRepository{store: store, indexer: indexer}, Recall: recall}
-	searchTool := NewWebSearchTaskAgentTool(webSearch)
-	if cfg.Server.Agent.SubAgentTimeoutMs > 0 {
-		searchTool.SetTimeout(time.Duration(cfg.Server.Agent.SubAgentTimeoutMs) * time.Millisecond)
+	searchService := websearch.URLAwareService{
+		Fallback: websearch.TavilyService{APIKey: cfg.Server.Tavily.APIKey},
 	}
 	catalog := agentruntime.NewToolCatalog(
-		sendMessageTool{sender: sender},
-		searchTool,
-		news.OpenIthomeArticleTool{Store: storeNewsStore{store: store, maxChars: cfg.Server.News.Ithome.ArticleMaxChars}},
-		storycap.SearchMemoryTool{Service: storyService},
+		sendMessageTool{sender: sender, screenshotDir: cfg.Server.Browser.ScreenshotDir},
+		analyzeImageTool{vision: vision.Agent{Client: llmClient}, requester: requesterFromSender(sender), screenshotDir: cfg.Server.Browser.ScreenshotDir},
+		news.OpenIthomeArticleTool{Store: storeNewsStore{store: store}},
+		storycap.SearchMemoryTool{Service: storyService, TopK: cfg.Server.Agent.Story.Memory.Retrieval.TopK},
+		&WebSearchTaskAgentTool{service: searchService},
+		calculateTool{},
 	)
+	if cfg.Server.Browser.Enabled {
+		browserClient, err := browsercap.NewClient(browsercap.Config{
+			BaseURL:        cfg.Server.Browser.BaseURL,
+			AuthToken:      cfg.Server.Browser.AuthToken,
+			Timeout:        time.Duration(cfg.Server.Browser.TimeoutMs) * time.Millisecond,
+			MaxResultChars: cfg.Server.Browser.MaxResultChars,
+		})
+		if err != nil {
+			store.Log("error", "Browser client configuration rejected", map[string]any{"event": "browser.config.invalid", "error": err.Error()})
+		} else {
+			catalog.Add(NewBrowserTaskAgentTool(
+				browserClient,
+				cfg.Server.Browser.DefaultSessionID,
+				cfg.Server.Browser.MaxTaskRounds,
+				llmClient,
+				cfg.Server.Browser.ScreenshotMaxBytes,
+				cfg.Server.Browser.ScreenshotDir,
+			))
+		}
+	}
+	if cfg.Server.MagnetSearch.Enabled {
+		timeout := time.Duration(cfg.Server.MagnetSearch.TimeoutMs) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 15 * time.Second
+		}
+		magnetService := magnetsearch.NewDefaultService(
+			&http.Client{Timeout: timeout},
+			cfg.Server.MagnetSearch.TokyoLibBaseURL,
+		)
+		catalog.Add(magnetsearch.SearchTool{
+			Service:      magnetService,
+			DefaultLimit: cfg.Server.MagnetSearch.DefaultLimit,
+		})
+	}
 	if terminalService != nil {
 		catalog.Add(terminal.BashTool{Service: terminalService})
 		catalog.Add(terminal.ReadBashOutputTool{Service: terminalService})
@@ -37,16 +81,79 @@ func buildBusinessTools(cfg *config.Config, store *db.Store, sender messaging.Se
 	return catalog
 }
 
+func requesterFromSender(sender messaging.Sender) napcatRequester {
+	requester, _ := sender.(napcatRequester)
+	return requester
+}
+
+type calculateTool struct{}
+
+func (calculateTool) Definition() agentruntime.ToolDefinition {
+	return agentruntime.ToolDefinition{Name: "calculate", Description: "对两个有限实数做一次二元四则运算（+、-、*、/）。", Parameters: agentruntime.ObjectSchema(map[string]any{
+		"a":  map[string]any{"type": "number", "description": "左操作数。"},
+		"op": map[string]any{"type": "string", "description": `运算符。可选值: "+"、"-"、"*"、"/"。`},
+		"b":  map[string]any{"type": "number", "description": "右操作数。"},
+	})}
+}
+
+func (calculateTool) Kind() string { return "business" }
+
+func (calculateTool) Execute(_ context.Context, call agentruntime.ToolCall) (agentruntime.ToolResult, error) {
+	a, okA := numberArg(call.Arguments["a"])
+	b, okB := numberArg(call.Arguments["b"])
+	op, _ := call.Arguments["op"].(string)
+	if !okA || !okB || math.IsNaN(a) || math.IsNaN(b) || math.IsInf(a, 0) || math.IsInf(b, 0) {
+		return jsonToolResult(map[string]any{"ok": false, "error": "INVALID_ARGUMENTS", "message": "a 和 b 必须是有限数字。"}), nil
+	}
+	switch op {
+	case "+":
+		return jsonToolResult(map[string]any{"ok": true, "result": a + b}), nil
+	case "-":
+		return jsonToolResult(map[string]any{"ok": true, "result": a - b}), nil
+	case "*":
+		return jsonToolResult(map[string]any{"ok": true, "result": a * b}), nil
+	case "/":
+		if b == 0 {
+			return jsonToolResult(map[string]any{"ok": false, "error": "DIVISION_BY_ZERO", "message": "除数不能是 0。"}), nil
+		}
+		return jsonToolResult(map[string]any{"ok": true, "result": a / b}), nil
+	default:
+		return jsonToolResult(map[string]any{"ok": false, "error": "INVALID_ARGUMENTS", "message": "op 必须是 +、-、*、/ 之一。"}), nil
+	}
+}
+
+func numberArg(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		n, err := v.Float64()
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func jsonToolResult(value map[string]any) agentruntime.ToolResult {
+	data, _ := json.Marshal(value)
+	return agentruntime.ToolResult{Kind: "business", Content: string(data)}
+}
+
 type sendMessageTool struct {
-	sender messaging.Sender
+	sender        messaging.Sender
+	screenshotDir string
 }
 
 func (t sendMessageTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "send_message", Description: "向当前群聊或私聊发送消息", Parameters: agentruntime.ObjectSchema(map[string]any{
-		"targetType": map[string]any{"type": "string"},
-		"targetId":   map[string]any{"type": "string"},
-		"message":    map[string]any{"type": "string"},
-		"os":         map[string]any{"type": "string", "description": "可选。公开展示用的一句话 OS/旁白，不是私密推理链；不会发送到 QQ。"},
+	return agentruntime.ToolDefinition{Name: "send_message", Description: "向指定群聊或私聊发送消息；省略目标时回复最新一条 QQ 消息所在会话。", Parameters: agentruntime.ObjectSchema(map[string]any{
+		"targetType": map[string]any{"type": "string", "enum": []string{"group", "private"}, "description": "回复路由类型，对应 qq_message 的 target_type。"},
+		"targetId":   map[string]any{"type": "string", "description": "回复路由 ID，对应 qq_message 的 target_id。"},
+		"message":    map[string]any{"type": "string", "description": "要发送的消息内容。"},
+		"imagePath":  map[string]any{"type": "string", "description": "可选浏览器截图路径，只允许 browser_screenshot 返回的受控截图文件。"},
 	})}
 }
 
@@ -59,14 +166,22 @@ func (t sendMessageTool) Execute(_ context.Context, call agentruntime.ToolCall) 
 	targetType, _ := call.Arguments["targetType"].(string)
 	targetID, _ := call.Arguments["targetId"].(string)
 	message, _ := call.Arguments["message"].(string)
+	imagePath, _ := call.Arguments["imagePath"].(string)
+	if strings.TrimSpace(imagePath) != "" {
+		safePath, err := allowedScreenshotPath(t.screenshotDir, imagePath)
+		if err != nil {
+			return jsonToolResult(map[string]any{"ok": false, "error": "IMAGE_PATH_NOT_ALLOWED", "message": err.Error()}), nil
+		}
+		message += cqImageFile(safePath)
+	}
 	if strings.TrimSpace(message) == "" {
-		return agentruntime.ToolResult{Kind: "business", Content: `{"ok":false,"error":"INVALID_ARGUMENTS","message":"message 不能为空。"}`}, nil
+		return jsonToolResult(map[string]any{"ok": false, "error": "EMPTY_MESSAGE", "message": "message 和 imagePath 至少需要一个。"}), nil
 	}
 	if targetID == "" {
-		return agentruntime.ToolResult{Kind: "business", Content: `{"ok":false,"error":"CHAT_CONTEXT_UNAVAILABLE","message":"当前缺少可发消息的 QQ 会话上下文，不能发送消息。"}`}, nil
+		return jsonToolResult(map[string]any{"ok": false, "error": "MESSAGE_TARGET_REQUIRED", "message": "缺少 targetType/targetId；请使用 qq_message 标签中的回复路由。"}), nil
 	}
 	if targetType == "" {
-		return agentruntime.ToolResult{Kind: "business", Content: `{"ok":false,"error":"CHAT_CONTEXT_UNAVAILABLE","message":"当前缺少可发消息的 QQ 会话类型，不能发送消息。"}`}, nil
+		return jsonToolResult(map[string]any{"ok": false, "error": "MESSAGE_TARGET_REQUIRED", "message": "缺少 targetType/targetId；请使用 qq_message 标签中的回复路由。"}), nil
 	}
 	var id int
 	var err error
@@ -79,17 +194,75 @@ func (t sendMessageTool) Execute(_ context.Context, call agentruntime.ToolCall) 
 	return agentruntime.ToolResult{Kind: "business", Content: string(data)}, err
 }
 
-func buildStoryTools(cfg *config.Config, store *db.Store) *agentruntime.ToolCatalog {
-	return buildStoryToolsForRange(cfg, store, 0, 0)
+func allowedScreenshotPath(root, candidate string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		root = "data/browser-screenshots"
+	}
+	rootPath, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	candidatePath, err := filepath.Abs(strings.TrimSpace(candidate))
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(candidatePath)
+	if err != nil {
+		return "", fmt.Errorf("截图文件不可用：%w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("截图路径不能是目录")
+	}
+	linkInfo, err := os.Lstat(candidatePath)
+	if err != nil {
+		return "", fmt.Errorf("截图文件不可用：%w", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("截图文件不能是符号链接")
+	}
+	relative, err := filepath.Rel(rootPath, candidatePath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("图片必须位于浏览器截图目录 %s", rootPath)
+	}
+	if resolvedRoot, rootErr := filepath.EvalSymlinks(rootPath); rootErr == nil {
+		if resolvedCandidate, candidateErr := filepath.EvalSymlinks(candidatePath); candidateErr == nil {
+			resolvedRelative, relErr := filepath.Rel(resolvedRoot, resolvedCandidate)
+			if relErr != nil || resolvedRelative == ".." || strings.HasPrefix(resolvedRelative, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("图片必须位于浏览器截图目录 %s", rootPath)
+			}
+		}
+	}
+	switch strings.ToLower(filepath.Ext(candidatePath)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+	default:
+		return "", fmt.Errorf("不支持的图片格式")
+	}
+	return candidatePath, nil
 }
 
-func buildStoryToolsForRange(cfg *config.Config, store *db.Store, startSeq, endSeq int) *agentruntime.ToolCatalog {
+func cqImageFile(path string) string {
+	slashPath := filepath.ToSlash(path)
+	if filepath.VolumeName(path) != "" && !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	fileURL := (&url.URL{Scheme: "file", Path: slashPath}).String()
+	return "[CQ:image,file=" + fileURL + "]"
+}
+
+func buildStoryTools(cfg *config.Config, store *db.Store) *agentruntime.ToolCatalog {
 	storyService := storycap.Service{Repo: storeStoryRepository{store: store, indexer: storycap.NewMemoryIndexer(cfg, store)}}
 	return agentruntime.NewToolCatalog(
-		storycap.CreateStoryTool{Service: storyService, SourceMessageSeqStart: startSeq, SourceMessageSeqEnd: endSeq},
-		storycap.RewriteStoryTool{Service: storyService, SourceMessageSeqStart: startSeq, SourceMessageSeqEnd: endSeq},
+		storycap.CreateStoryTool{Service: storyService},
+		storycap.RewriteStoryTool{Service: storyService},
 		storycap.FinishStoryBatchTool{},
 	)
+}
+
+func firstString(items []string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0]
 }
 
 type storeStoryRepository struct {
@@ -124,7 +297,7 @@ func (r storeStoryRepository) Save(ctx context.Context, story storycap.Story) er
 }
 
 func (r storeStoryRepository) List(context.Context) ([]storycap.Story, error) {
-	items := r.store.ListStories()
+	items := r.store.Snapshot().Stories
 	out := make([]storycap.Story, 0, len(items))
 	for _, item := range items {
 		out = append(out, storycap.Story{
@@ -152,26 +325,18 @@ func (r storeStoryRepository) Delete(_ context.Context, id string) error {
 }
 
 type storeNewsStore struct {
-	store    *db.Store
-	maxChars int
+	store *db.Store
 }
 
 func (s storeNewsStore) FindArticle(id int) (news.Article, bool) {
-	article, ok := s.store.FindNewsArticleByID(id)
-	if !ok {
-		return news.Article{}, false
+	for _, article := range s.store.Snapshot().NewsArticles {
+		if article.ID == id {
+			content := article.Content
+			if content == "" {
+				content = article.RSSSummary
+			}
+			return news.Article{ID: article.ID, Title: article.Title, URL: article.URL, Content: content}, true
+		}
 	}
-	content := article.Content
-	source := "article_content"
-	if content == "" {
-		content = article.RSSSummary
-		source = "rss_summary"
-	}
-	truncated := false
-	maxChars := s.maxChars
-	if maxChars > 0 && len([]rune(content)) > maxChars {
-		content = string([]rune(content)[:maxChars])
-		truncated = true
-	}
-	return news.Article{ID: article.ID, Title: article.Title, URL: article.URL, PublishedAt: article.PublishedAt.Format("2006-01-02 15:04"), Content: content, ContentSource: source, Truncated: truncated, MaxChars: maxChars}, true
+	return news.Article{}, false
 }

@@ -9,6 +9,7 @@ import (
 
 // Config 是从 config.yaml 加载的顶层 YAML 配置。
 //
+// 它刻意沿用 TS config.yaml.example 的结构，方便部署环境
 // 在实现语言切换后继续复用同一份配置文件。
 type Config struct {
 	Server ServerConfig `yaml:"server"`
@@ -16,37 +17,68 @@ type Config struct {
 
 // ServerConfig 汇总所有后端运行时设置。
 type ServerConfig struct {
-	DatabaseURL string       `yaml:"databaseUrl"`
-	Port        int          `yaml:"port"`
-	Agent       AgentConfig  `yaml:"agent"`
-	News        NewsConfig   `yaml:"news"`
-	Napcat      NapcatConfig `yaml:"napcat"`
-	LLM         LLMConfig    `yaml:"llm"`
-	Tavily      TavilyConfig `yaml:"tavily"`
-	Bot         BotConfig    `yaml:"bot"`
+	DatabaseURL  string             `yaml:"databaseUrl"`
+	Port         int                `yaml:"port"`
+	Agent        AgentConfig        `yaml:"agent"`
+	Browser      BrowserConfig      `yaml:"browser"`
+	News         NewsConfig         `yaml:"news"`
+	MagnetSearch MagnetSearchConfig `yaml:"magnetSearch"`
+	Napcat       NapcatConfig       `yaml:"napcat"`
+	LLM          LLMConfig          `yaml:"llm"`
+	Tavily       TavilyConfig       `yaml:"tavily"`
+	Bot          BotConfig          `yaml:"bot"`
+}
+
+// BrowserConfig 控制真实浏览器 sidecar 及 Browser Task Agent。
+type BrowserConfig struct {
+	Enabled            bool   `yaml:"enabled"`
+	BaseURL            string `yaml:"baseUrl"`
+	AuthToken          string `yaml:"authToken"`
+	TimeoutMs          int    `yaml:"timeoutMs"`
+	DefaultSessionID   string `yaml:"defaultSessionId"`
+	MaxTaskRounds      int    `yaml:"maxTaskRounds"`
+	MaxResultChars     int    `yaml:"maxResultChars"`
+	ScreenshotMaxBytes int64  `yaml:"screenshotMaxBytes"`
+	ScreenshotDir      string `yaml:"screenshotDir"`
+}
+
+type MagnetSearchConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	TimeoutMs       int    `yaml:"timeoutMs"`
+	DefaultLimit    int    `yaml:"defaultLimit"`
+	TokyoLibBaseURL string `yaml:"tokyoLibBaseUrl"`
 }
 
 // AgentConfig 控制 root/story 循环节奏和能力限制。
 type AgentConfig struct {
-	ContextCompactionTotalTokenThreshold int            `yaml:"contextCompactionTotalTokenThreshold"`
-	LLMRetryBackoffMs                    int            `yaml:"llmRetryBackoffMs"`
-	WaitToolMaxWaitMs                    int            `yaml:"waitToolMaxWaitMs"`
-	NotificationBatchWindowMs            int            `yaml:"notificationBatchWindowMs"`
-	EventBurstQuietMs                    int            `yaml:"eventBurstQuietMs"`
-	EventBurstMaxWaitMs                  int            `yaml:"eventBurstMaxWaitMs"`
-	GroupReplyCooldownMs                 int            `yaml:"groupReplyCooldownMs"`
-	SubAgentTimeoutMs                    int            `yaml:"subAgentTimeoutMs"`
-	Story                                StoryConfig    `yaml:"story"`
-	Terminal                             TerminalConfig `yaml:"terminal"`
+	ContextCompactionTotalTokenThreshold int              `yaml:"contextCompactionTotalTokenThreshold"`
+	LLMRetryBackoffMs                    int              `yaml:"llmRetryBackoffMs"`
+	WaitToolMaxWaitMs                    int              `yaml:"waitToolMaxWaitMs"`
+	CacheKeepaliveEnabled                bool             `yaml:"cacheKeepaliveEnabled"`
+	NotificationBatchWindowMs            int              `yaml:"notificationBatchWindowMs"`
+	Autonomous                           AutonomousConfig `yaml:"autonomous"`
+	Story                                StoryConfig      `yaml:"story"`
+	Terminal                             TerminalConfig   `yaml:"terminal"`
+}
+
+// AutonomousConfig 控制没有外部事件时的受控自我延续。
+type AutonomousConfig struct {
+	Enabled              bool `yaml:"enabled"`
+	IdleDelayMs          int  `yaml:"idleDelayMs"`
+	MaxConsecutiveRounds int  `yaml:"maxConsecutiveRounds"`
+	CooldownMs           int  `yaml:"cooldownMs"`
 }
 
 // StoryConfig 控制 Story 批处理、记忆和召回行为。
 type StoryConfig struct {
-	BatchSize       int `yaml:"batchSize"`
-	IdleFlushMs     int `yaml:"idleFlushMs"`
-	LedgerKeepCount int `yaml:"ledgerKeepCount"`
-	Memory          struct {
+	BatchSize                            int `yaml:"batchSize"`
+	IdleFlushMs                          int `yaml:"idleFlushMs"`
+	ContextCompactionTotalTokenThreshold int `yaml:"contextCompactionTotalTokenThreshold"`
+	Memory                               struct {
 		Embedding EmbeddingConfig `yaml:"embedding"`
+		Retrieval struct {
+			TopK int `yaml:"topK"`
+		} `yaml:"retrieval"`
 	} `yaml:"memory"`
 	Recall struct {
 		TopK           int     `yaml:"topK"`
@@ -95,12 +127,25 @@ type NapcatConfig struct {
 	StartupContextRecentMessageCount int      `yaml:"startupContextRecentMessageCount"`
 }
 
-// LLMConfig 定义供应商和用途调用链。
+// LLMConfig 定义供应商、用途调用链和 OAuth 账号。
 type LLMConfig struct {
-	TimeoutMs      int                 `yaml:"timeoutMs"`
-	DebugReasoning bool                `yaml:"debugReasoning"`
-	Providers      LLMProvidersConfig  `yaml:"providers"`
-	Usages         map[string]LLMUsage `yaml:"usages"`
+	TimeoutMs                  int                 `yaml:"timeoutMs"`
+	AuthUsageRefreshIntervalMs int                 `yaml:"authUsageRefreshIntervalMs"`
+	Providers                  LLMProvidersConfig  `yaml:"providers"`
+	Usages                     map[string]LLMUsage `yaml:"usages"`
+	CodexAuth                  OAuthProviderConfig `yaml:"codexAuth"`
+	ClaudeCodeAuth             OAuthProviderConfig `yaml:"claudeCodeAuth"`
+}
+
+// OAuthProviderConfig 控制单个供应商的 OAuth 集成。
+type OAuthProviderConfig struct {
+	Enabled                bool   `yaml:"enabled"`
+	PublicBaseURL          string `yaml:"publicBaseUrl"`
+	OAuthRedirectPath      string `yaml:"oauthRedirectPath"`
+	OAuthStateTtlMs        int    `yaml:"oauthStateTtlMs"`
+	RefreshLeewayMs        int    `yaml:"refreshLeewayMs"`
+	RefreshCheckIntervalMs int    `yaml:"refreshCheckIntervalMs"`
+	BinaryPath             string `yaml:"binaryPath"`
 }
 
 // LLMProvidersConfig 包含所有受支持的 LLM 供应商定义。
@@ -109,6 +154,7 @@ type LLMProvidersConfig struct {
 	OpenAI      LLMProviderConfig `yaml:"openai"`
 	OpenAICodex LLMProviderConfig `yaml:"openaiCodex"`
 	ClaudeCode  LLMProviderConfig `yaml:"claudeCode"`
+	Google      LLMProviderConfig `yaml:"google"`
 }
 
 // LLMProviderConfig 是 API key、base URL、模型列表共用的供应商结构。
@@ -125,9 +171,10 @@ type LLMUsage struct {
 
 // LLMAttempt 选择一个供应商/模型，并可指定重试次数。
 type LLMAttempt struct {
-	Provider string `yaml:"provider"`
-	Model    string `yaml:"model"`
-	Times    int    `yaml:"times"`
+	Provider  string `yaml:"provider"`
+	Model     string `yaml:"model"`
+	Times     int    `yaml:"times"`
+	MaxTokens int    `yaml:"maxTokens"`
 }
 
 // TavilyConfig 保存网页搜索 API key。
@@ -165,32 +212,59 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.Agent.ContextCompactionTotalTokenThreshold == 0 {
 		cfg.Server.Agent.ContextCompactionTotalTokenThreshold = 150000
 	}
+	if cfg.Server.Agent.WaitToolMaxWaitMs == 0 {
+		cfg.Server.Agent.WaitToolMaxWaitMs = int((10 * time.Minute).Milliseconds())
+	}
+	if cfg.Server.Agent.Autonomous.IdleDelayMs == 0 {
+		cfg.Server.Agent.Autonomous.IdleDelayMs = int((30 * time.Second).Milliseconds())
+	}
+	if cfg.Server.Agent.Autonomous.MaxConsecutiveRounds == 0 {
+		cfg.Server.Agent.Autonomous.MaxConsecutiveRounds = 4
+	}
+	if cfg.Server.Agent.Autonomous.CooldownMs == 0 {
+		cfg.Server.Agent.Autonomous.CooldownMs = int((5 * time.Minute).Milliseconds())
+	}
 	if cfg.Server.Agent.Story.BatchSize == 0 {
 		cfg.Server.Agent.Story.BatchSize = 24
 	}
 	if cfg.Server.Agent.Story.IdleFlushMs == 0 {
 		cfg.Server.Agent.Story.IdleFlushMs = int((2 * time.Minute).Milliseconds())
 	}
-	if cfg.Server.Agent.EventBurstQuietMs == 0 {
-		cfg.Server.Agent.EventBurstQuietMs = 1200
+	if cfg.Server.Agent.Story.ContextCompactionTotalTokenThreshold == 0 {
+		cfg.Server.Agent.Story.ContextCompactionTotalTokenThreshold = 60000
 	}
-	if cfg.Server.Agent.EventBurstMaxWaitMs == 0 {
-		cfg.Server.Agent.EventBurstMaxWaitMs = 3000
+	if cfg.Server.Browser.BaseURL == "" {
+		cfg.Server.Browser.BaseURL = "http://127.0.0.1:20009"
 	}
-	if cfg.Server.Agent.GroupReplyCooldownMs == 0 {
-		cfg.Server.Agent.GroupReplyCooldownMs = 20000
+	if cfg.Server.Browser.TimeoutMs == 0 {
+		cfg.Server.Browser.TimeoutMs = 60000
 	}
-	if cfg.Server.Agent.SubAgentTimeoutMs == 0 {
-		cfg.Server.Agent.SubAgentTimeoutMs = 30000
+	if cfg.Server.Browser.DefaultSessionID == "" {
+		cfg.Server.Browser.DefaultSessionID = "default"
 	}
-	if cfg.Server.Agent.Story.LedgerKeepCount == 0 {
-		cfg.Server.Agent.Story.LedgerKeepCount = 1000
+	if cfg.Server.Browser.MaxTaskRounds == 0 {
+		cfg.Server.Browser.MaxTaskRounds = 12
+	}
+	if cfg.Server.Browser.MaxResultChars == 0 {
+		cfg.Server.Browser.MaxResultChars = 16000
+	}
+	if cfg.Server.Browser.ScreenshotMaxBytes == 0 {
+		cfg.Server.Browser.ScreenshotMaxBytes = 8 << 20
+	}
+	if cfg.Server.Browser.ScreenshotDir == "" {
+		cfg.Server.Browser.ScreenshotDir = "data/browser-screenshots"
 	}
 	if cfg.Server.Napcat.ReconnectMs == 0 {
 		cfg.Server.Napcat.ReconnectMs = 3000
 	}
 	if cfg.Server.Napcat.RequestTimeoutMs == 0 {
 		cfg.Server.Napcat.RequestTimeoutMs = 10000
+	}
+	if cfg.Server.MagnetSearch.TimeoutMs == 0 {
+		cfg.Server.MagnetSearch.TimeoutMs = 15000
+	}
+	if cfg.Server.MagnetSearch.DefaultLimit == 0 {
+		cfg.Server.MagnetSearch.DefaultLimit = 30
 	}
 	if cfg.Server.LLM.TimeoutMs == 0 {
 		cfg.Server.LLM.TimeoutMs = 45000

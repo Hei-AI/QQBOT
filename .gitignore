@@ -41,3 +41,11 @@ config.yaml
 
 # temp
 *temp.txt
+logs/
+api_out.json
+prod.config.yaml
+local.config.yaml
+.gocache
+doc/阵营击杀竞猜/例子
+/.gocache_local/
+.gomodcache

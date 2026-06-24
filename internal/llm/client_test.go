@@ -1,81 +1,53 @@
 package llm
 
-import "testing"
+import (
+	"encoding/base64"
+	"testing"
+)
 
-func TestCodexRequestBodyDropsOrphanFunctionCallOutputs(t *testing.T) {
-	payload := toCodexRequestBody(LLMChatRequest{
-		Model: "gpt-test",
-		Messages: []LLMMessage{
-			{Role: "tool", ToolCallID: "missing", Content: "orphan"},
-			{Role: "assistant", ToolCalls: []LLMToolCall{{ID: "call_ok", Name: "wait", Arguments: map[string]any{}}}},
-			{Role: "tool", ToolCallID: "call_ok", Content: "paired"},
-		},
-	}, "")
-	input, ok := payload["input"].([]map[string]any)
-	if !ok {
-		t.Fatalf("input has unexpected type: %#v", payload["input"])
+func TestVisionAttemptSupportsImages(t *testing.T) {
+	if visionAttemptSupportsImages("deepseek", "deepseek-v4-pro") {
+		t.Fatal("deepseek reasoner should not be treated as image-capable")
 	}
-	outputs := 0
-	for _, item := range input {
-		if item["type"] == "function_call_output" {
-			outputs++
-			if item["call_id"] != "call_ok" {
-				t.Fatalf("unexpected function_call_output survived: %#v", item)
-			}
-		}
+	if !visionAttemptSupportsImages("openai", "gpt-4o-mini") {
+		t.Fatal("gpt-4o-mini should be treated as image-capable")
 	}
-	if outputs != 1 {
-		t.Fatalf("expected exactly one paired function_call_output, got %d: %#v", outputs, input)
+	if !visionAttemptSupportsImages("claude-code", "claude-sonnet-4.6") {
+		t.Fatal("claude-code should be treated as image-capable")
+	}
+	if !visionAttemptSupportsImages("google", "gemini-3.5-flash") {
+		t.Fatal("gemini should be treated as image-capable")
 	}
 }
 
-func TestCodexRequestBodyDropsFunctionCallsWithoutOutputs(t *testing.T) {
-	payload := toCodexRequestBody(LLMChatRequest{
-		Model: "gpt-test",
-		Messages: []LLMMessage{
-			{Role: "assistant", ToolCalls: []LLMToolCall{
-				{ID: "call_missing", Name: "wait", Arguments: map[string]any{}},
-				{ID: "call_ok", Name: "wait", Arguments: map[string]any{}},
-			}},
-			{Role: "tool", ToolCallID: "call_ok", Content: "paired"},
-		},
-	}, "")
-	input, ok := payload["input"].([]map[string]any)
-	if !ok {
-		t.Fatalf("input has unexpected type: %#v", payload["input"])
-	}
-	calls := 0
-	outputs := 0
-	for _, item := range input {
-		switch item["type"] {
-		case "function_call":
-			calls++
-			if item["call_id"] != "call_ok" {
-				t.Fatalf("unexpected function_call survived: %#v", item)
-			}
-		case "function_call_output":
-			outputs++
-			if item["call_id"] != "call_ok" {
-				t.Fatalf("unexpected function_call_output survived: %#v", item)
-			}
-		}
-	}
-	if calls != 1 || outputs != 1 {
-		t.Fatalf("expected one paired call/output, got calls=%d outputs=%d input=%#v", calls, outputs, input)
+func TestOpenAIChatPayloadIncludesMaxTokens(t *testing.T) {
+	payload := toOpenAIChatPayload(LLMChatRequest{Provider: "deepseek", Model: "deepseek-v4-flash", MaxTokens: 2048})
+	if payload["max_tokens"] != 2048 {
+		t.Fatalf("max_tokens missing from payload: %#v", payload)
 	}
 }
 
-func TestExtractSSEEventAcceptsCRLF(t *testing.T) {
-	text := "event: response.created\r\n" +
-		"data: {\"ignored\":true}\r\n\r\n" +
-		"event: response.completed\r\n" +
-		"data: {\"response\":{\"id\":\"resp_1\",\"output\":[]}}\r\n\r\n"
-	event := extractSSEEvent(text, "response.completed")
-	if event == nil {
-		t.Fatal("expected response.completed event")
+func TestGoogleInteractionInputConvertsInlineImage(t *testing.T) {
+	data := []byte("image")
+	input, summary, err := googleInteractionInput([]LLMMessage{{
+		Role: "user",
+		Content: []any{
+			map[string]any{"type": "text", "text": "describe"},
+			map[string]any{"type": "image", "mimeType": "image/png", "dataUrl": "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	response, _ := event["response"].(map[string]any)
-	if response["id"] != "resp_1" {
-		t.Fatalf("unexpected event payload: %#v", event)
+	if len(input) != 2 {
+		t.Fatalf("unexpected google interaction input: %#v", input)
+	}
+	image, _ := input[1].(map[string]any)
+	decoded, err := base64.StdEncoding.DecodeString(image["data"].(string))
+	if err != nil || string(decoded) != string(data) {
+		t.Fatalf("unexpected image bytes: %q err=%v", decoded, err)
+	}
+	if len(summary) != 1 {
+		t.Fatalf("unexpected request summary: %#v", summary)
 	}
 }

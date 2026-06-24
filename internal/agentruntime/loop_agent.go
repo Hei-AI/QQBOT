@@ -3,6 +3,7 @@ package agentruntime
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // LoopAgent 是 root 和任务 Agent 共用的生命周期约定。
@@ -12,12 +13,12 @@ type LoopAgent interface {
 	Stop()
 }
 
-// BaseLoopAgent 提供可取消的无 tick RunOnce 循环。
+// BaseLoopAgent 提供可取消的周期性 RunOnce 循环。
 //
-// 如果需要等待，RunOnce 内部的工具或队列负责阻塞。
+// 更具体的 Agent 复用该行为，并提供自己的 RunOnce。
 type BaseLoopAgent struct {
-	RunOnce         func(context.Context) error
-	OnStopRequested func()
+	Interval time.Duration
+	RunOnce  func(context.Context) error
 
 	mu      sync.Mutex
 	running bool
@@ -44,16 +45,22 @@ func (a *BaseLoopAgent) Run(ctx context.Context) error {
 		a.mu.Unlock()
 	}()
 
+	interval := a.Interval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
 		if a.RunOnce != nil {
 			if err := a.RunOnce(ctx); err != nil {
 				return err
 			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
 		}
 	}
 }
@@ -64,8 +71,5 @@ func (a *BaseLoopAgent) Stop() {
 	defer a.mu.Unlock()
 	if a.stop != nil {
 		a.stop()
-	}
-	if a.OnStopRequested != nil {
-		a.OnStopRequested()
 	}
 }

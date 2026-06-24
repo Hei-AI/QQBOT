@@ -1,15 +1,19 @@
 package ops
 
 import (
+	rootagent "QqBot/internal/agent"
+	authruntime "QqBot/internal/capabilities/auth"
+	"QqBot/internal/common"
+	"QqBot/internal/config"
+	"QqBot/internal/db"
+	"QqBot/internal/llm"
+	"QqBot/internal/metric"
+	"QqBot/internal/napcat"
+	"QqBot/internal/scheduler"
 	"embed"
 	"net/http"
-	rootagent "qqbot-ai/internal/agent"
-	"qqbot-ai/internal/common"
-	"qqbot-ai/internal/config"
-	"qqbot-ai/internal/db"
-	"qqbot-ai/internal/llm"
-	"qqbot-ai/internal/metric"
-	"qqbot-ai/internal/napcat"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -18,17 +22,22 @@ import (
 var staticFiles embed.FS
 
 type HTTPServer struct {
-	cfg    *config.Config
-	store  *db.Store
-	llm    *llm.LLMClient
-	napcat *napcat.NapcatGateway
-	agent  *rootagent.AgentRuntime
-	charts *metric.MetricChartService
-	mux    *http.ServeMux
+	cfg         *config.Config
+	store       *db.Store
+	llm         *llm.LLMClient
+	napcat      *napcat.NapcatGateway
+	agent       *rootagent.AgentRuntime
+	charts      *metric.MetricChartService
+	scheduler   *scheduler.TaskScheduler
+	authRuntime *authruntime.Runtime
+	mux         *http.ServeMux
 }
 
-func NewHTTPServer(cfg *config.Config, store *db.Store, llmClient *llm.LLMClient, napcatGateway *napcat.NapcatGateway, agentRuntime *rootagent.AgentRuntime, charts *metric.MetricChartService) http.Handler {
-	s := &HTTPServer{cfg: cfg, store: store, llm: llmClient, napcat: napcatGateway, agent: agentRuntime, charts: charts, mux: http.NewServeMux()}
+func NewHTTPServer(cfg *config.Config, store *db.Store, llmClient *llm.LLMClient, napcatGateway *napcat.NapcatGateway, agentRuntime *rootagent.AgentRuntime, charts *metric.MetricChartService, taskScheduler *scheduler.TaskScheduler, authRuntime *authruntime.Runtime) http.Handler {
+	if authRuntime == nil {
+		authRuntime = authruntime.NewRuntime(cfg, store)
+	}
+	s := &HTTPServer{cfg: cfg, store: store, llm: llmClient, napcat: napcatGateway, agent: agentRuntime, charts: charts, scheduler: taskScheduler, authRuntime: authRuntime, mux: http.NewServeMux()}
 	s.routes()
 	return traceMiddleware(s.mux)
 }
@@ -42,6 +51,10 @@ func (s *HTTPServer) routes() {
 	s.mux.HandleFunc("/napcat/group/send", s.sendGroup)
 	s.mux.HandleFunc("/napcat/private/send", s.sendPrivate)
 	s.mux.HandleFunc("/agent-dashboard/current", s.dashboard)
+	s.mux.HandleFunc("/agent-dashboard/reset-persisted-state", s.dashboardReset)
+	s.mux.HandleFunc("/agent-stack/query", s.agentStackQuery)
+	s.mux.HandleFunc("/tool-execution/query", s.toolExecutionQuery)
+	s.mux.HandleFunc("/agent-task/query", s.agentTaskQuery)
 	s.mux.HandleFunc("/app-log/query", s.appLogQuery)
 	s.mux.HandleFunc("/llm-chat-call/query", s.llmCallQuery)
 	s.mux.HandleFunc("/napcat-event/query", s.napcatEventQuery)
@@ -52,6 +65,10 @@ func (s *HTTPServer) routes() {
 	s.mux.HandleFunc("/metric-chart/data", s.metricChartData)
 	s.mux.HandleFunc("/metric-chart/create", s.metricChartCreate)
 	s.mux.HandleFunc("/metric-chart/delete", s.metricChartDelete)
+	s.mux.HandleFunc("/auth/", s.auth)
+	s.mux.HandleFunc("/callback", s.authCallback)
+	s.mux.HandleFunc("/scheduler/tasks", s.schedulerTasks)
+	s.mux.HandleFunc("/scheduler/tasks/", s.schedulerTaskAction)
 }
 
 func (s *HTTPServer) static(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +85,7 @@ func (s *HTTPServer) static(w http.ResponseWriter, r *http.Request) {
 
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Trace-Id", common.NewID())
+		w.Header().Set("X-Kagami-Trace-Id", common.NewID())
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -171,6 +188,69 @@ func (s *HTTPServer) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	common.WriteJSON(w, http.StatusOK, s.agent.Snapshot(s.llm))
+}
+
+func (s *HTTPServer) dashboardReset(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	s.agent.ResetPersistedState()
+	common.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *HTTPServer) agentStackQuery(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	page, pageSize := common.ParsePage(r)
+	runtimeKey := common.QueryString(r, "runtimeKey")
+	items := s.store.ListAgentStackItems(runtimeKey, 0, 0)
+	for left, right := 0, len(items)-1; left < right; left, right = left+1, right-1 {
+		items[left], items[right] = items[right], items[left]
+	}
+	kind := common.QueryString(r, "kind")
+	filtered := items[:0]
+	for _, item := range items {
+		if kind == "" || item.Kind == kind {
+			filtered = append(filtered, item)
+		}
+	}
+	pageItems, pagination := db.Paginate(filtered, page, pageSize)
+	common.WriteJSON(w, http.StatusOK, map[string]any{"pagination": pagination, "items": pageItems})
+}
+
+func (s *HTTPServer) toolExecutionQuery(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	page, pageSize := common.ParsePage(r)
+	status := common.QueryString(r, "status")
+	items := s.store.ListToolExecutions()
+	filtered := items[:0]
+	for _, item := range items {
+		if status == "" || item.Status == status {
+			filtered = append(filtered, item)
+		}
+	}
+	pageItems, pagination := db.Paginate(filtered, page, pageSize)
+	common.WriteJSON(w, http.StatusOK, map[string]any{"pagination": pagination, "items": pageItems})
+}
+
+func (s *HTTPServer) agentTaskQuery(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	page, pageSize := common.ParsePage(r)
+	status := common.QueryString(r, "status")
+	items := s.store.ListAgentTasks()
+	filtered := items[:0]
+	for _, item := range items {
+		if status == "" || item.Status == status {
+			filtered = append(filtered, item)
+		}
+	}
+	pageItems, pagination := db.Paginate(filtered, page, pageSize)
+	common.WriteJSON(w, http.StatusOK, map[string]any{"pagination": pagination, "items": pageItems})
 }
 
 func (s *HTTPServer) appLogQuery(w http.ResponseWriter, r *http.Request) {
@@ -332,8 +412,7 @@ func (s *HTTPServer) storyReindex(w http.ResponseWriter, r *http.Request) {
 	if mode == "" {
 		mode = "outdated"
 	}
-	data := s.store.Snapshot()
-	common.WriteJSON(w, http.StatusOK, map[string]any{"mode": mode, "totalStories": len(data.Stories), "targetedStories": len(data.Stories), "reindexedStories": 0, "skippedStories": len(data.Stories), "failedStories": 0, "failures": []any{}})
+	common.WriteJSON(w, http.StatusOK, rootagent.ReindexStories(r.Context(), s.cfg, s.store, mode))
 }
 
 func (s *HTTPServer) metricChartList(w http.ResponseWriter, r *http.Request) {
@@ -374,4 +453,135 @@ func (s *HTTPServer) metricChartDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	common.WriteJSON(w, http.StatusOK, s.charts.Delete(common.AsString(req["chartName"])))
+}
+
+func (s *HTTPServer) auth(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/auth/callback" {
+		s.authCallback(w, r)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/auth/"), "/")
+	if len(parts) != 2 {
+		common.WriteJSON(w, http.StatusNotFound, map[string]any{"message": "not found"})
+		return
+	}
+	provider, action := parts[0], parts[1]
+	if provider != "codex" && provider != "claude-code" {
+		common.WriteJSON(w, http.StatusBadRequest, map[string]any{"message": "请求参数不合法"})
+		return
+	}
+	switch action {
+	case "status":
+		if !s.requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		common.WriteJSON(w, http.StatusOK, s.authRuntime.Status(toInternalProvider(provider)))
+	case "login-url":
+		if !s.requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		resp, err := s.authRuntime.LoginURL(provider)
+		if err != nil {
+			common.WriteJSON(w, http.StatusBadRequest, map[string]any{"message": err.Error()})
+			return
+		}
+		common.WriteJSON(w, http.StatusOK, resp)
+	case "logout":
+		if !s.requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		common.WriteJSON(w, http.StatusOK, s.authRuntime.Logout(toInternalProvider(provider)))
+	case "refresh":
+		if !s.requireMethod(w, r, http.MethodPost) {
+			return
+		}
+		resp, err := s.authRuntime.Refresh(r.Context(), toInternalProvider(provider))
+		if err != nil {
+			common.WriteJSON(w, http.StatusBadGateway, map[string]any{"message": err.Error()})
+			return
+		}
+		common.WriteJSON(w, http.StatusOK, resp)
+	case "usage-limits":
+		if !s.requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		common.WriteJSON(w, http.StatusOK, s.authRuntime.UsageLimits(provider))
+	case "usage-trend":
+		if !s.requireMethod(w, r, http.MethodGet) {
+			return
+		}
+		rangeValue := common.QueryString(r, "range")
+		if rangeValue == "" {
+			rangeValue = "24h"
+		}
+		common.WriteJSON(w, http.StatusOK, s.authRuntime.UsageTrend(toInternalProvider(provider), rangeValue))
+	default:
+		common.WriteJSON(w, http.StatusNotFound, map[string]any{"message": "not found"})
+	}
+}
+
+func (s *HTTPServer) authCallback(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	provider := "claude-code"
+	if strings.HasPrefix(r.URL.Path, "/auth/callback") {
+		provider = "codex"
+	}
+	resp, err := s.authRuntime.Callback(r.Context(), toInternalProvider(provider), common.QueryString(r, "state"), common.QueryString(r, "code"))
+	if err != nil {
+		common.WriteJSON(w, http.StatusBadRequest, map[string]any{"message": err.Error()})
+		return
+	}
+	common.WriteJSON(w, http.StatusOK, resp)
+}
+
+func (s *HTTPServer) schedulerTasks(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	if s.scheduler == nil {
+		common.WriteJSON(w, http.StatusOK, map[string]any{"tasks": []any{}})
+		return
+	}
+	common.WriteJSON(w, http.StatusOK, map[string]any{"tasks": s.scheduler.ListStatus()})
+}
+
+func (s *HTTPServer) schedulerTaskAction(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/scheduler/tasks/")
+	if !strings.HasSuffix(rest, "/trigger") {
+		common.WriteJSON(w, http.StatusNotFound, map[string]any{"message": "not found"})
+		return
+	}
+	encodedName := strings.TrimSuffix(rest, "/trigger")
+	encodedName = strings.TrimSuffix(encodedName, "/")
+	name, err := url.PathUnescape(encodedName)
+	if err != nil || strings.TrimSpace(name) == "" {
+		common.WriteJSON(w, http.StatusBadRequest, map[string]any{"message": "请求参数不合法"})
+		return
+	}
+	if s.scheduler == nil {
+		common.WriteJSON(w, http.StatusNotFound, map[string]any{"message": "scheduler not available"})
+		return
+	}
+	resp, err := s.scheduler.TriggerNow(r.Context(), name)
+	if err != nil {
+		common.WriteJSON(w, http.StatusNotFound, map[string]any{"message": err.Error()})
+		return
+	}
+	common.WriteJSON(w, http.StatusOK, resp)
+}
+
+func toInternalProvider(provider string) string {
+	if provider == "codex" {
+		return "openai-codex"
+	}
+	return provider
+}
+
+func init() {
+	_ = sort.Strings
 }

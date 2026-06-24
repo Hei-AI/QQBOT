@@ -1,10 +1,12 @@
 package websearch
 
 import (
+	"QqBot/internal/common"
 	"context"
 	"encoding/json"
+	"strings"
 
-	"qqbot-ai/internal/agentruntime"
+	"QqBot/internal/agentruntime"
 )
 
 // SearchWebRawTool 向内部网页搜索任务 Agent 暴露原始搜索结果。
@@ -32,12 +34,11 @@ func (t SearchWebRawTool) Execute(ctx context.Context, call agentruntime.ToolCal
 type FinalizeWebSearchTool struct{}
 
 func (FinalizeWebSearchTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "finalize_web_search", Description: "完成网页搜索任务并返回答案", Parameters: agentruntime.ObjectSchema(map[string]any{"answer": map[string]any{"type": "string"}, "sources": map[string]any{"type": "array"}})}
+	return agentruntime.ToolDefinition{Name: "finalize_web_search", Description: "在信息已经足够时提交最终搜索摘要。摘要必须基于已检索到的结果，并明确保留不确定性。", Parameters: agentruntime.ObjectSchema(map[string]any{"summary": map[string]any{"type": "string", "description": "给主 Agent 的最终中文摘要。"}})}
 }
 func (FinalizeWebSearchTool) Kind() string { return "control" }
 func (FinalizeWebSearchTool) Execute(_ context.Context, call agentruntime.ToolCall) (agentruntime.ToolResult, error) {
-	data, _ := json.Marshal(call.Arguments)
-	return agentruntime.ToolResult{Kind: "control", Content: string(data)}, nil
+	return agentruntime.ToolResult{Kind: "control", Content: strings.TrimSpace(common.AsString(call.Arguments["summary"]))}, nil
 }
 
 // SearchWebTool 是面向根 Agent 的网页搜索能力。

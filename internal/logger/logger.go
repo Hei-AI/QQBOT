@@ -1,9 +1,10 @@
 package logger
 
-import "qqbot-ai/internal/db"
+import "QqBot/internal/db"
 
 // Logger 是一个由 Store 支撑的小型结构化日志器。
 //
+// 它对应 TS logger 的运行时思路：调用方带着级别、消息和
 // 元数据写日志，接收端决定记录去向；当前接收端是 db.Store。
 type Logger struct {
 	Store  *db.Store

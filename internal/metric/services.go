@@ -1,9 +1,9 @@
 package metric
 
 import (
+	"QqBot/internal/common"
+	"QqBot/internal/db"
 	"net/http"
-	"qqbot-ai/internal/common"
-	"qqbot-ai/internal/db"
 	"sort"
 	"time"
 )
@@ -15,6 +15,13 @@ type MetricService struct {
 
 // NewMetricService 创建由 Store 支撑的指标记录器。
 func NewMetricService(store *db.Store) *MetricService { return &MetricService{store: store} }
+
+func (s *MetricService) Record(name string, value float64, tags map[string]string) {
+	if s == nil || s.store == nil {
+		return
+	}
+	s.store.AddMetric(name, value, tags)
+}
 
 // MetricChartService 管理图表定义和时间分桶聚合。
 type MetricChartService struct {
@@ -62,7 +69,8 @@ func (s *MetricChartService) Data(chartName, bucket, rangePreset string, startAt
 	var chart *db.MetricChart
 	for _, c := range data.MetricCharts {
 		if c.ChartName == chartName {
-			chart = new(c)
+			cc := c
+			chart = &cc
 			break
 		}
 	}

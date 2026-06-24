@@ -1,11 +1,12 @@
 package db
 
 import (
+	"QqBot/internal/agentruntime"
+	"QqBot/internal/common"
 	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"qqbot-ai/internal/common"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ type Store struct {
 	mu   sync.Mutex
 	path string
 	db   *sql.DB
+	Data StoreData
 }
 
 // StoreData 是管理台和现有上层代码使用的兼容快照结构。
@@ -28,6 +30,7 @@ type StoreData struct {
 	NapcatEvents    []NapcatEventItem          `json:"napcatEvents"`
 	NapcatMessages  []NapcatMessageItem        `json:"napcatMessages"`
 	StoryLedger     []StoryLedgerItem          `json:"storyLedger"`
+	Ledger          []LinearLedgerItem         `json:"linearMessageLedger"`
 	Stories         []StoryItem                `json:"stories"`
 	StoryDocuments  []StoryMemoryDocument      `json:"storyMemoryDocuments"`
 	EmbeddingCache  []EmbeddingCacheItem       `json:"embeddingCache"`
@@ -35,7 +38,13 @@ type StoreData struct {
 	MetricCharts    []MetricChart              `json:"metricCharts"`
 	NewsArticles    []NewsArticle              `json:"newsArticles"`
 	NewsFeedCursors []NewsFeedCursor           `json:"newsFeedCursors"`
+	NewsFeedCursor  []NewsFeedCursor           `json:"newsFeedCursor"`
 	AgentSnapshots  map[string]json.RawMessage `json:"agentSnapshots"`
+	OAuthSessions   []OAuthSession             `json:"oauthSessions"`
+	AuthUsage       []AuthUsageSnapshot        `json:"authUsageSnapshots"`
+	AgentSnapshot   AgentRuntimeSnapshot       `json:"agentRuntimeSnapshot"`
+	TerminalState   TerminalState              `json:"terminalState"`
+	TerminalOutput  []TerminalOutputItem       `json:"terminalOutput"`
 }
 
 const (
@@ -92,17 +101,25 @@ type NapcatEventItem struct {
 
 // NapcatMessageItem 对应标准化后的 QQ 群聊/私聊消息。
 type NapcatMessageItem struct {
-	ID          int            `json:"id"`
-	MessageType string         `json:"messageType"`
-	SubType     string         `json:"subType"`
-	GroupID     *string        `json:"groupId"`
-	UserID      *string        `json:"userId"`
-	Nickname    *string        `json:"nickname"`
-	MessageID   *int           `json:"messageId"`
-	Message     any            `json:"message"`
-	EventTime   *time.Time     `json:"eventTime"`
-	Payload     map[string]any `json:"payload"`
-	CreatedAt   time.Time      `json:"createdAt"`
+	ID              int              `json:"id"`
+	MessageType     string           `json:"messageType"`
+	SubType         string           `json:"subType"`
+	GroupID         *string          `json:"groupId"`
+	UserID          *string          `json:"userId"`
+	Nickname        *string          `json:"nickname"`
+	MessageID       *int             `json:"messageId"`
+	Message         any              `json:"message"`
+	RawMessage      string           `json:"rawMessage"`
+	MessageSegments []MessageSegment `json:"messageSegments"`
+	EventTime       *time.Time       `json:"eventTime"`
+	Payload         map[string]any   `json:"payload"`
+	CreatedAt       time.Time        `json:"createdAt"`
+}
+
+type MessageSegment struct {
+	Type string         `json:"type"`
+	Data map[string]any `json:"data"`
+	Text string         `json:"text,omitempty"`
 }
 
 // StoryLedgerItem 保存 Root 运行时写给 Story Agent 的线性消息账本。
@@ -112,6 +129,13 @@ type StoryLedgerItem struct {
 	Role       string    `json:"role"`
 	Content    string    `json:"content"`
 	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type LinearLedgerItem struct {
+	ID         int                  `json:"id"`
+	RuntimeKey string               `json:"runtimeKey"`
+	Message    agentruntime.Message `json:"message"`
+	CreatedAt  time.Time            `json:"createdAt"`
 }
 
 // StoryItem 是 Story 记忆在根包中的 JSON 表示。
@@ -198,7 +222,104 @@ type NewsFeedCursor struct {
 	SourceKey           string    `json:"sourceKey"`
 	LastSeenArticleID   int       `json:"lastSeenArticleId"`
 	LastSeenPublishedAt time.Time `json:"lastSeenPublishedAt"`
+	CreatedAt           time.Time `json:"createdAt"`
 	UpdatedAt           time.Time `json:"updatedAt"`
+}
+
+type OAuthSession struct {
+	Provider      string     `json:"provider"`
+	AccountID     *string    `json:"accountId"`
+	Email         *string    `json:"email"`
+	AccessToken   string     `json:"accessToken,omitempty"`
+	RefreshToken  string     `json:"refreshToken,omitempty"`
+	IDToken       string     `json:"idToken,omitempty"`
+	ExpiresAt     *time.Time `json:"expiresAt"`
+	LastRefreshAt *time.Time `json:"lastRefreshAt"`
+	Status        string     `json:"status"`
+	LastError     *string    `json:"lastError"`
+}
+
+type AuthUsageSnapshot struct {
+	ID               int        `json:"id"`
+	Provider         string     `json:"provider"`
+	AccountID        string     `json:"accountId"`
+	WindowKey        string     `json:"windowKey"`
+	RemainingPercent float64    `json:"remainingPercent"`
+	ResetAt          *time.Time `json:"resetAt"`
+	CapturedAt       time.Time  `json:"capturedAt"`
+}
+
+type AgentRuntimeSnapshot struct {
+	RootMessages  []agentruntime.Message `json:"rootMessages"`
+	StoryMessages []agentruntime.Message `json:"storyMessages"`
+	Session       map[string]any         `json:"session"`
+	StoryLastSeq  int                    `json:"storyLastSeq"`
+	Fingerprint   string                 `json:"fingerprint"`
+	UpdatedAt     time.Time              `json:"updatedAt"`
+}
+
+type TerminalState struct {
+	CWD       string    `json:"cwd"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type TerminalOutputItem struct {
+	ID        int       `json:"id"`
+	OutputID  string    `json:"outputId"`
+	Stdout    string    `json:"stdout"`
+	Stderr    string    `json:"stderr"`
+	ExitCode  int       `json:"exitCode"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type AgentStackItem struct {
+	ID         int            `json:"id"`
+	RuntimeKey string         `json:"runtimeKey"`
+	Kind       string         `json:"kind"`
+	Role       string         `json:"role,omitempty"`
+	ToolCallID string         `json:"toolCallId,omitempty"`
+	ToolName   string         `json:"toolName,omitempty"`
+	Content    any            `json:"content"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+	CreatedAt  time.Time      `json:"createdAt"`
+}
+
+type ToolExecutionItem struct {
+	ID             int            `json:"id"`
+	ExecutionKey   string         `json:"executionKey"`
+	RuntimeKey     string         `json:"runtimeKey"`
+	ToolCallID     string         `json:"toolCallId"`
+	ToolName       string         `json:"toolName"`
+	Arguments      map[string]any `json:"arguments"`
+	Result         string         `json:"result,omitempty"`
+	Status         string         `json:"status"`
+	SideEffect     bool           `json:"sideEffect"`
+	Attempt        int            `json:"attempt"`
+	LeaseOwner     string         `json:"leaseOwner,omitempty"`
+	LeaseExpiresAt *time.Time     `json:"leaseExpiresAt,omitempty"`
+	ErrorMessage   string         `json:"errorMessage,omitempty"`
+	CreatedAt      time.Time      `json:"createdAt"`
+	UpdatedAt      time.Time      `json:"updatedAt"`
+	CompletedAt    *time.Time     `json:"completedAt,omitempty"`
+}
+
+type AgentTaskItem struct {
+	ID             int            `json:"id"`
+	TaskKey        string         `json:"taskKey"`
+	TaskType       string         `json:"taskType"`
+	Payload        map[string]any `json:"payload"`
+	Status         string         `json:"status"`
+	SideEffect     bool           `json:"sideEffect"`
+	Attempt        int            `json:"attempt"`
+	MaxAttempts    int            `json:"maxAttempts"`
+	AvailableAt    time.Time      `json:"availableAt"`
+	LeaseOwner     string         `json:"leaseOwner,omitempty"`
+	LeaseExpiresAt *time.Time     `json:"leaseExpiresAt,omitempty"`
+	Result         map[string]any `json:"result,omitempty"`
+	ErrorMessage   string         `json:"errorMessage,omitempty"`
+	CreatedAt      time.Time      `json:"createdAt"`
+	UpdatedAt      time.Time      `json:"updatedAt"`
+	CompletedAt    *time.Time     `json:"completedAt,omitempty"`
 }
 
 // OpenStore 加载或创建 SQLite 持久化文件。
@@ -244,6 +365,19 @@ func (s *Store) initSchema() error {
 		`CREATE INDEX IF NOT EXISTS idx_news_articles_source_id ON news_articles(source_key, id)`,
 		`CREATE TABLE IF NOT EXISTS news_feed_cursors (source_key TEXT PRIMARY KEY, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS agent_snapshots (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS oauth_sessions (provider TEXT PRIMARY KEY, item TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS auth_usage_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, account_id TEXT NOT NULL, captured_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_usage_provider_account ON auth_usage_snapshots(provider, account_id, captured_at)`,
+		`CREATE TABLE IF NOT EXISTS terminal_state (key TEXT PRIMARY KEY, item TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS terminal_outputs (id INTEGER PRIMARY KEY AUTOINCREMENT, output_id TEXT NOT NULL, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_terminal_outputs_output_id ON terminal_outputs(output_id, id)`,
+		`CREATE TABLE IF NOT EXISTS agent_stack_items (id INTEGER PRIMARY KEY AUTOINCREMENT, runtime_key TEXT NOT NULL, kind TEXT NOT NULL, tool_call_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_stack_runtime_id ON agent_stack_items(runtime_key, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_stack_tool_call ON agent_stack_items(tool_call_id, id)`,
+		`CREATE TABLE IF NOT EXISTS tool_executions (id INTEGER PRIMARY KEY AUTOINCREMENT, execution_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL, side_effect INTEGER NOT NULL DEFAULT 0, lease_expires_at TEXT, updated_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_tool_executions_status_lease ON tool_executions(status, lease_expires_at)`,
+		`CREATE TABLE IF NOT EXISTS agent_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, task_key TEXT NOT NULL UNIQUE, task_type TEXT NOT NULL, status TEXT NOT NULL, available_at TEXT NOT NULL, lease_expires_at TEXT, updated_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_agent_tasks_claim ON agent_tasks(status, available_at, id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -256,6 +390,9 @@ func (s *Store) initSchema() error {
 func (s *Store) maintainStorage() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.repairStoryTimesLocked(); err != nil {
+		return err
+	}
 	compacted, err := s.compactOversizedLlmCallsLocked()
 	if err != nil {
 		return err
@@ -271,6 +408,57 @@ func (s *Store) maintainStorage() error {
 		}
 	}
 	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return nil
+}
+
+func (s *Store) repairStoryTimesLocked() error {
+	rows, err := s.db.Query(`SELECT id, item FROM stories`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type update struct {
+		id   string
+		item StoryItem
+	}
+	updates := []update{}
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			return err
+		}
+		var item StoryItem
+		if json.Unmarshal([]byte(raw), &item) != nil || (!item.CreatedAt.IsZero() && !item.UpdatedAt.IsZero()) {
+			continue
+		}
+		repairedAt, parseErr := time.ParseInLocation("20060102150405.000000000", id, time.Local)
+		if parseErr != nil {
+			repairedAt = time.Now()
+		}
+		if item.CreatedAt.IsZero() {
+			item.CreatedAt = repairedAt
+		}
+		if item.UpdatedAt.IsZero() {
+			item.UpdatedAt = item.CreatedAt
+		}
+		updates = append(updates, update{id: id, item: item})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := s.db.Exec(
+			`UPDATE stories SET updated_at = ?, item = ? WHERE id = ?`,
+			formatTime(update.item.UpdatedAt),
+			mustJSON(update.item),
+			update.id,
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -338,6 +526,94 @@ func (s *Store) Close() error {
 
 func (s *Store) Flush() error {
 	return nil
+}
+
+func (s *Store) DeleteOlder(kind string, threshold time.Time) int {
+	total := 0
+	for {
+		deleted := s.DeleteOlderLimit(kind, threshold, 0)
+		total += deleted
+		if deleted == 0 {
+			return total
+		}
+	}
+}
+
+func (s *Store) DeleteOlderLimit(kind string, threshold time.Time, limit int) int {
+	if deleted, ok := s.deleteOlderLimitFromData(kind, threshold, limit); ok {
+		return deleted
+	}
+	table := ""
+	column := "created_at"
+	switch kind {
+	case "app_log":
+		table = "app_logs"
+	case "llm_chat_call":
+		table = "llm_calls"
+	case "metric":
+		table = "metrics"
+	case "napcat_event":
+		table = "napcat_events"
+	case "napcat_qq_message":
+		table = "napcat_messages"
+	case "embedding_cache":
+		table = "embedding_cache"
+		column = "json_extract(item, '$.createdAt')"
+	case "auth_usage_snapshot":
+		table = "auth_usage_snapshots"
+		column = "captured_at"
+	case "terminal_output":
+		table = "terminal_outputs"
+	case "oauth_state":
+		return 0
+	default:
+		return 0
+	}
+	query := `DELETE FROM ` + table + ` WHERE id IN (SELECT id FROM ` + table + ` WHERE ` + column + ` < ? ORDER BY id ASC`
+	args := []any{formatTime(threshold)}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	query += `)`
+	s.mu.Lock()
+	result, err := s.db.Exec(query, args...)
+	s.mu.Unlock()
+	if err != nil {
+		return 0
+	}
+	rows, _ := result.RowsAffected()
+	return int(rows)
+}
+
+func (s *Store) deleteOlderLimitFromData(kind string, threshold time.Time, limit int) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := 0
+	shouldDelete := func(createdAt time.Time) bool {
+		if !createdAt.Before(threshold) {
+			return false
+		}
+		return limit <= 0 || deleted < limit
+	}
+	switch kind {
+	case "app_log":
+		if len(s.Data.AppLogs) == 0 {
+			return 0, false
+		}
+		out := s.Data.AppLogs[:0]
+		for _, item := range s.Data.AppLogs {
+			if shouldDelete(item.CreatedAt) {
+				deleted++
+				continue
+			}
+			out = append(out, item)
+		}
+		s.Data.AppLogs = out
+	default:
+		return 0, false
+	}
+	return deleted, true
 }
 
 func (s *Store) Log(level, message string, metadata map[string]any) {
@@ -426,7 +702,8 @@ func (s *Store) CountStoryLedgerAfter(runtimeKey string, afterSeq int) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var count int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM story_ledger WHERE runtime_key = ? AND seq > ?`, runtimeKey, afterSeq).Scan(&count)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM story_ledger
+		WHERE runtime_key = ? AND seq > ? AND json_extract(item, '$.seq') IS NOT NULL`, runtimeKey, afterSeq).Scan(&count)
 	return count
 }
 
@@ -434,13 +711,17 @@ func (s *Store) LatestStoryLedger(runtimeKey string) (StoryLedgerItem, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var raw string
-	err := s.db.QueryRow(`SELECT item FROM story_ledger WHERE runtime_key = ? ORDER BY seq DESC LIMIT 1`, runtimeKey).Scan(&raw)
+	err := s.db.QueryRow(`SELECT item FROM story_ledger
+		WHERE runtime_key = ? AND json_extract(item, '$.seq') IS NOT NULL
+		ORDER BY seq DESC LIMIT 1`, runtimeKey).Scan(&raw)
 	var item StoryLedgerItem
 	return item, err == nil && json.Unmarshal([]byte(raw), &item) == nil
 }
 
 func (s *Store) ListStoryLedgerAfter(runtimeKey string, afterSeq, limit int) []StoryLedgerItem {
-	query := `SELECT item FROM story_ledger WHERE runtime_key = ? AND seq > ? ORDER BY seq ASC`
+	query := `SELECT item FROM story_ledger
+		WHERE runtime_key = ? AND seq > ? AND json_extract(item, '$.seq') IS NOT NULL
+		ORDER BY seq ASC`
 	args := []any{runtimeKey, afterSeq}
 	if limit > 0 {
 		query += ` LIMIT ?`
@@ -519,9 +800,176 @@ func (s *Store) AddMetric(name string, value float64, tags map[string]string) {
 	s.mu.Unlock()
 }
 
+func (s *Store) AddAuthUsageSnapshots(items []AuthUsageSnapshot) {
+	if len(items) == 0 {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range items {
+		if item.CapturedAt.IsZero() {
+			item.CapturedAt = now
+		}
+		result, err := s.db.Exec(`INSERT INTO auth_usage_snapshots(provider, account_id, captured_at, item) VALUES(?, ?, ?, ?)`, item.Provider, item.AccountID, formatTime(item.CapturedAt), mustJSON(item))
+		if err == nil {
+			if id, idErr := result.LastInsertId(); idErr == nil {
+				item.ID = int(id)
+				_, _ = s.db.Exec(`UPDATE auth_usage_snapshots SET item = ? WHERE id = ?`, mustJSON(item), id)
+			}
+		}
+	}
+}
+
+func (s *Store) AppendLedger(runtimeKey string, message agentruntime.Message) int {
+	item := LinearLedgerItem{RuntimeKey: runtimeKey, Message: message, CreatedAt: time.Now()}
+	s.mu.Lock()
+	result, err := s.db.Exec(`INSERT INTO story_ledger(runtime_key, created_at, item) VALUES(?, ?, ?)`, runtimeKey, formatTime(item.CreatedAt), mustJSON(item))
+	if err == nil {
+		if id, idErr := result.LastInsertId(); idErr == nil {
+			item.ID = int(id)
+			_, _ = s.db.Exec(`UPDATE story_ledger SET item = ? WHERE seq = ?`, mustJSON(item), id)
+		}
+	}
+	s.mu.Unlock()
+	return item.ID
+}
+
+func (s *Store) LedgerAfter(runtimeKey string, seq int, limit int) []LinearLedgerItem {
+	query := `SELECT item FROM story_ledger WHERE runtime_key = ? AND seq > ? ORDER BY seq ASC`
+	args := []any{runtimeKey, seq}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return queryJSONRows[LinearLedgerItem](s.db, query, args...)
+}
+
+func (s *Store) SaveAgentRuntimeSnapshot(snapshot AgentRuntimeSnapshot) {
+	if snapshot.Fingerprint != "" {
+		if current, ok := s.AgentRuntimeSnapshot(); ok && current.Fingerprint == snapshot.Fingerprint {
+			return
+		}
+	}
+	snapshot.UpdatedAt = time.Now()
+	s.SaveAgentSnapshot("agentRuntimeSnapshot", snapshot)
+}
+
+func (s *Store) AgentRuntimeSnapshot() (AgentRuntimeSnapshot, bool) {
+	var snapshot AgentRuntimeSnapshot
+	ok := s.LoadAgentSnapshot("agentRuntimeSnapshot", &snapshot)
+	if !ok || snapshot.UpdatedAt.IsZero() {
+		return AgentRuntimeSnapshot{}, false
+	}
+	return snapshot, true
+}
+
+func (s *Store) ResetAgentRuntimeState() {
+	s.mu.Lock()
+	_, _ = s.db.Exec(`DELETE FROM agent_snapshots WHERE key = ?`, "agentRuntimeSnapshot")
+	_, _ = s.db.Exec(`DELETE FROM story_ledger`)
+	_, _ = s.db.Exec(`DELETE FROM agent_stack_items`)
+	_, _ = s.db.Exec(`DELETE FROM tool_executions`)
+	_, _ = s.db.Exec(`DELETE FROM agent_tasks`)
+	s.mu.Unlock()
+}
+
+func (s *Store) LoadTerminalCWD() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var raw string
+	if err := s.db.QueryRow(`SELECT item FROM terminal_state WHERE key = ?`, "default").Scan(&raw); err != nil {
+		return ""
+	}
+	var state TerminalState
+	_ = json.Unmarshal([]byte(raw), &state)
+	return state.CWD
+}
+
+func (s *Store) SaveTerminalCWD(cwd string) {
+	state := TerminalState{CWD: cwd, UpdatedAt: time.Now()}
+	s.mu.Lock()
+	_, _ = s.db.Exec(`INSERT OR REPLACE INTO terminal_state(key, item) VALUES(?, ?)`, "default", mustJSON(state))
+	s.mu.Unlock()
+}
+
+func (s *Store) SaveTerminalOutput(outputID, stdout, stderr string, exitCode int) {
+	item := TerminalOutputItem{OutputID: outputID, Stdout: stdout, Stderr: stderr, ExitCode: exitCode, CreatedAt: time.Now()}
+	s.mu.Lock()
+	result, err := s.db.Exec(`INSERT INTO terminal_outputs(output_id, created_at, item) VALUES(?, ?, ?)`, outputID, formatTime(item.CreatedAt), mustJSON(item))
+	if err == nil {
+		if id, idErr := result.LastInsertId(); idErr == nil {
+			item.ID = int(id)
+			_, _ = s.db.Exec(`UPDATE terminal_outputs SET item = ? WHERE id = ?`, mustJSON(item), id)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Store) ReadTerminalOutput(outputID string) (TerminalOutputItem, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var raw string
+	err := s.db.QueryRow(`SELECT item FROM terminal_outputs WHERE output_id = ? ORDER BY id DESC LIMIT 1`, outputID).Scan(&raw)
+	var item TerminalOutputItem
+	return item, err == nil && json.Unmarshal([]byte(raw), &item) == nil
+}
+
+func (s *Store) ReadTerminalOutputFields(outputID string) (stdout, stderr string, exitCode int, ok bool) {
+	item, found := s.ReadTerminalOutput(outputID)
+	if !found {
+		return "", "", 0, false
+	}
+	return item.Stdout, item.Stderr, item.ExitCode, true
+}
+
+func (s *Store) LatestAuthUsage(provider, accountID string) []AuthUsageSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := queryJSONRows[AuthUsageSnapshot](s.db, `SELECT item FROM auth_usage_snapshots WHERE provider = ? AND account_id = ? ORDER BY captured_at ASC`, provider, accountID)
+	latest := map[string]AuthUsageSnapshot{}
+	for _, item := range items {
+		current, ok := latest[item.WindowKey]
+		if !ok || item.CapturedAt.After(current.CapturedAt) {
+			latest[item.WindowKey] = item
+		}
+	}
+	out := make([]AuthUsageSnapshot, 0, len(latest))
+	for _, item := range latest {
+		out = append(out, item)
+	}
+	return out
+}
+
+func (s *Store) AuthUsageInRange(provider, accountID string, since time.Time) []AuthUsageSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return queryJSONRows[AuthUsageSnapshot](s.db, `SELECT item FROM auth_usage_snapshots WHERE provider = ? AND account_id = ? AND captured_at >= ? ORDER BY captured_at ASC`, provider, accountID, formatTime(since))
+}
+
 // AddStory 追加或替换一条 Story 记忆。
 func (s *Store) AddStory(item StoryItem) {
 	s.mu.Lock()
+	now := time.Now()
+	if item.CreatedAt.IsZero() {
+		var raw string
+		var existing StoryItem
+		if err := s.db.QueryRow(`SELECT item FROM stories WHERE id = ?`, item.ID).Scan(&raw); err == nil {
+			_ = json.Unmarshal([]byte(raw), &existing)
+		}
+		if !existing.CreatedAt.IsZero() {
+			item.CreatedAt = existing.CreatedAt
+		} else if parsed, err := time.ParseInLocation("20060102150405.000000000", item.ID, time.Local); err == nil {
+			item.CreatedAt = parsed
+		} else {
+			item.CreatedAt = now
+		}
+	}
+	if item.UpdatedAt.IsZero() {
+		item.UpdatedAt = now
+	}
 	_, _ = s.db.Exec(`INSERT OR REPLACE INTO stories(id, updated_at, item) VALUES(?, ?, ?)`, item.ID, formatTime(item.UpdatedAt), mustJSON(item))
 	s.mu.Unlock()
 }
@@ -646,12 +1094,34 @@ func (s *Store) DeleteMetricChart(name string) {
 
 // AddNewsArticle 追加一篇已入库新闻文章。
 func (s *Store) AddNewsArticle(article NewsArticle) {
+	if article.CreatedAt.IsZero() {
+		article.CreatedAt = time.Now()
+	}
+	if article.UpdatedAt.IsZero() {
+		article.UpdatedAt = article.CreatedAt
+	}
 	s.mu.Lock()
-	result, err := s.db.Exec(`INSERT INTO news_articles(source_key, upstream_id, item) VALUES(?, ?, ?)`, article.SourceKey, article.UpstreamID, mustJSON(article))
+	var result sql.Result
+	var err error
+	upstreamID := article.UpstreamID
+	if upstreamID == "" {
+		if article.ID > 0 {
+			upstreamID = "local-id:" + common.JSONNumber(float64(article.ID))
+		} else {
+			upstreamID = "local:" + common.NewID()
+		}
+	}
+	if article.ID > 0 {
+		result, err = s.db.Exec(`INSERT OR REPLACE INTO news_articles(id, source_key, upstream_id, item) VALUES(?, ?, ?, ?)`, article.ID, article.SourceKey, upstreamID, mustJSON(article))
+	} else {
+		result, err = s.db.Exec(`INSERT INTO news_articles(source_key, upstream_id, item) VALUES(?, ?, ?)`, article.SourceKey, upstreamID, mustJSON(article))
+	}
 	if err == nil {
 		if id, idErr := result.LastInsertId(); idErr == nil {
-			article.ID = int(id)
-			_, _ = s.db.Exec(`UPDATE news_articles SET item = ? WHERE id = ?`, mustJSON(article), id)
+			if article.ID == 0 {
+				article.ID = int(id)
+			}
+			_, _ = s.db.Exec(`UPDATE news_articles SET item = ? WHERE id = ?`, mustJSON(article), article.ID)
 		}
 	}
 	s.mu.Unlock()
@@ -705,10 +1175,99 @@ func (s *Store) NewsFeedCursor(sourceKey string) (NewsFeedCursor, bool) {
 	return cursor, err == nil && json.Unmarshal([]byte(raw), &cursor) == nil
 }
 
-func (s *Store) UpsertNewsFeedCursor(cursor NewsFeedCursor) {
+func (s *Store) UpsertNewsFeedCursor(sourceKey string, articleID int, publishedAt time.Time) {
+	if sourceKey == "" || articleID == 0 || publishedAt.IsZero() {
+		return
+	}
+	cursor := NewsFeedCursor{
+		SourceKey:           sourceKey,
+		LastSeenArticleID:   articleID,
+		LastSeenPublishedAt: publishedAt,
+		UpdatedAt:           time.Now(),
+	}
+	if existing, ok := s.NewsFeedCursor(sourceKey); ok {
+		cursor.CreatedAt = existing.CreatedAt
+	}
+	if cursor.CreatedAt.IsZero() {
+		cursor.CreatedAt = cursor.UpdatedAt
+	}
 	cursor.UpdatedAt = time.Now()
 	s.mu.Lock()
 	_, _ = s.db.Exec(`INSERT OR REPLACE INTO news_feed_cursors(source_key, item) VALUES(?, ?)`, cursor.SourceKey, mustJSON(cursor))
+	s.mu.Unlock()
+}
+
+func (s *Store) ListNewsArticlesLatest(sourceKey string, limit int) []NewsArticle {
+	items := s.ListNewsArticlesBySource(sourceKey)
+	sortNewsArticlesNewestFirst(items)
+	return limitNewsArticles(items, limit)
+}
+
+func (s *Store) ListNewsArticlesNewerThanCursor(sourceKey string, cursor NewsFeedCursor, limit int) []NewsArticle {
+	items := []NewsArticle{}
+	for _, article := range s.ListNewsArticlesBySource(sourceKey) {
+		if newsArticleAfterCursor(article, cursor) {
+			items = append(items, article)
+		}
+	}
+	sortNewsArticlesNewestFirst(items)
+	return limitNewsArticles(items, limit)
+}
+
+func (s *Store) CountNewsArticlesNewerThanCursor(sourceKey string, cursor NewsFeedCursor) int {
+	count := 0
+	for _, article := range s.ListNewsArticlesBySource(sourceKey) {
+		if newsArticleAfterCursor(article, cursor) {
+			count++
+		}
+	}
+	return count
+}
+
+func sortNewsArticlesNewestFirst(items []NewsArticle) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].PublishedAt.Equal(items[j].PublishedAt) {
+			return items[i].ID > items[j].ID
+		}
+		return items[i].PublishedAt.After(items[j].PublishedAt)
+	})
+}
+
+func limitNewsArticles(items []NewsArticle, limit int) []NewsArticle {
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return append([]NewsArticle(nil), items...)
+}
+
+func newsArticleAfterCursor(article NewsArticle, cursor NewsFeedCursor) bool {
+	if cursor.LastSeenArticleID == 0 || cursor.LastSeenPublishedAt.IsZero() {
+		return true
+	}
+	if article.PublishedAt.After(cursor.LastSeenPublishedAt) {
+		return true
+	}
+	return article.PublishedAt.Equal(cursor.LastSeenPublishedAt) && article.ID > cursor.LastSeenArticleID
+}
+
+func (s *Store) UpsertOAuthSession(session OAuthSession) {
+	s.mu.Lock()
+	_, _ = s.db.Exec(`INSERT OR REPLACE INTO oauth_sessions(provider, item) VALUES(?, ?)`, session.Provider, mustJSON(session))
+	s.mu.Unlock()
+}
+
+func (s *Store) OAuthSession(provider string) (OAuthSession, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var raw string
+	err := s.db.QueryRow(`SELECT item FROM oauth_sessions WHERE provider = ?`, provider).Scan(&raw)
+	var session OAuthSession
+	return session, err == nil && json.Unmarshal([]byte(raw), &session) == nil
+}
+
+func (s *Store) DeleteOAuthSession(provider string) {
+	s.mu.Lock()
+	_, _ = s.db.Exec(`DELETE FROM oauth_sessions WHERE provider = ?`, provider)
 	s.mu.Unlock()
 }
 
@@ -730,10 +1289,14 @@ func (s *Store) Snapshot() StoreData {
 	defer s.mu.Unlock()
 	out := StoreData{AgentSnapshots: map[string]json.RawMessage{}}
 	out.AppLogs = queryJSONRows[AppLogItem](s.db, `SELECT item FROM app_logs ORDER BY id ASC`)
+	if len(s.Data.AppLogs) > 0 {
+		out.AppLogs = append(out.AppLogs, s.Data.AppLogs...)
+	}
 	out.LlmCalls = queryJSONRows[LlmCallItem](s.db, `SELECT item FROM llm_calls ORDER BY id ASC`)
 	out.NapcatEvents = queryJSONRows[NapcatEventItem](s.db, `SELECT item FROM napcat_events ORDER BY id ASC`)
 	out.NapcatMessages = queryJSONRows[NapcatMessageItem](s.db, `SELECT item FROM napcat_messages ORDER BY id ASC`)
 	out.StoryLedger = queryJSONRows[StoryLedgerItem](s.db, `SELECT item FROM story_ledger ORDER BY seq ASC`)
+	out.Ledger = queryJSONRows[LinearLedgerItem](s.db, `SELECT item FROM story_ledger ORDER BY seq ASC`)
 	out.Stories = queryJSONRows[StoryItem](s.db, `SELECT item FROM stories ORDER BY updated_at ASC`)
 	out.StoryDocuments = queryJSONRows[StoryMemoryDocument](s.db, `SELECT item FROM story_documents ORDER BY id ASC`)
 	out.EmbeddingCache = queryJSONRows[EmbeddingCacheItem](s.db, `SELECT item FROM embedding_cache ORDER BY id ASC`)
@@ -741,6 +1304,14 @@ func (s *Store) Snapshot() StoreData {
 	out.MetricCharts = queryJSONRows[MetricChart](s.db, `SELECT item FROM metric_charts ORDER BY chart_name ASC`)
 	out.NewsArticles = queryJSONRows[NewsArticle](s.db, `SELECT item FROM news_articles ORDER BY id ASC`)
 	out.NewsFeedCursors = queryJSONRows[NewsFeedCursor](s.db, `SELECT item FROM news_feed_cursors ORDER BY source_key ASC`)
+	out.NewsFeedCursor = append([]NewsFeedCursor(nil), out.NewsFeedCursors...)
+	out.OAuthSessions = queryJSONRows[OAuthSession](s.db, `SELECT item FROM oauth_sessions ORDER BY provider ASC`)
+	out.AuthUsage = queryJSONRows[AuthUsageSnapshot](s.db, `SELECT item FROM auth_usage_snapshots ORDER BY id ASC`)
+	out.TerminalOutput = queryJSONRows[TerminalOutputItem](s.db, `SELECT item FROM terminal_outputs ORDER BY id ASC`)
+	var terminalRaw string
+	if err := s.db.QueryRow(`SELECT item FROM terminal_state WHERE key = ?`, "default").Scan(&terminalRaw); err == nil {
+		_ = json.Unmarshal([]byte(terminalRaw), &out.TerminalState)
+	}
 	rows, err := s.db.Query(`SELECT key, value FROM agent_snapshots`)
 	if err == nil {
 		defer rows.Close()
@@ -750,6 +1321,9 @@ func (s *Store) Snapshot() StoreData {
 				out.AgentSnapshots[key] = json.RawMessage(value)
 			}
 		}
+	}
+	if raw, ok := out.AgentSnapshots["agentRuntimeSnapshot"]; ok {
+		_ = json.Unmarshal(raw, &out.AgentSnapshot)
 	}
 	return out
 }
@@ -845,6 +1419,10 @@ func setItemID(item any, id int) {
 		v.ID = id
 	case *MetricItem:
 		v.ID = id
+	case *AuthUsageSnapshot:
+		v.ID = id
+	case *TerminalOutputItem:
+		v.ID = id
 	}
 }
 
@@ -887,7 +1465,8 @@ func StringPtr(v any) *string {
 		}
 		return &x
 	case float64:
-		return new(common.JSONNumber(x))
+		s := common.JSONNumber(x)
+		return &s
 	default:
 		return nil
 	}
@@ -899,7 +1478,8 @@ func IntPtr(v any) *int {
 	case int:
 		return &x
 	case float64:
-		return new(int(x))
+		i := int(x)
+		return &i
 	default:
 		return nil
 	}

@@ -1,20 +1,21 @@
 package story
 
 import (
+	"QqBot/internal/config"
+	"QqBot/internal/db"
+	"QqBot/internal/embedding"
 	"context"
 	"fmt"
-	"qqbot-ai/internal/config"
-	"qqbot-ai/internal/db"
-	"qqbot-ai/internal/embedding"
 	"sort"
 	"strings"
 )
 
 // VectorRecall 使用 Story 文档向量为根 Agent 提供长期记忆召回。
 type VectorRecall struct {
-	store  *db.Store
-	client *embedding.Client
-	cfg    config.EmbeddingConfig
+	store       *db.Store
+	client      *embedding.Client
+	cfg         config.EmbeddingConfig
+	defaultTopK int
 }
 
 // NewVectorRecall 根据配置创建 Story 向量召回器；配置为空时返回 nil。
@@ -23,10 +24,15 @@ func NewVectorRecall(cfg *config.Config, store *db.Store) *VectorRecall {
 	if strings.TrimSpace(embeddingCfg.Provider) == "" || strings.TrimSpace(embeddingCfg.Model) == "" {
 		return nil
 	}
+	topK := cfg.Server.Agent.Story.Memory.Retrieval.TopK
+	if topK <= 0 {
+		topK = 3
+	}
 	return &VectorRecall{
-		store:  store,
-		client: embedding.NewClient(embeddingCfg, StoreEmbeddingCache{Store: store}),
-		cfg:    embeddingCfg,
+		store:       store,
+		client:      embedding.NewClient(embeddingCfg, StoreEmbeddingCache{Store: store}),
+		cfg:         embeddingCfg,
+		defaultTopK: topK,
 	}
 }
 
@@ -35,7 +41,10 @@ func (r *VectorRecall) Search(ctx context.Context, query string, limit int) ([]S
 		return nil, fmt.Errorf("story vector recall is not configured")
 	}
 	if limit <= 0 {
-		limit = 5
+		limit = r.defaultTopK
+	}
+	if limit <= 0 {
+		limit = 3
 	}
 	resp, err := r.client.Embed(ctx, embedding.Request{
 		Content:              query,
@@ -65,8 +74,12 @@ func (r *VectorRecall) Search(ctx context.Context, query string, limit int) ([]S
 		Score float64
 		Kinds map[string]bool
 	}{}
+	documentLimit := limit * 3
+	if documentLimit < 1 {
+		documentLimit = 1
+	}
 	for i, item := range hits {
-		if i >= limit*3 {
+		if i >= documentLimit {
 			break
 		}
 		current := grouped[item.StoryID]

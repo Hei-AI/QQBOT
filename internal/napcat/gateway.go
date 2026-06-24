@@ -1,18 +1,20 @@
 package napcat
 
 import (
+	rootagent "QqBot/internal/agent"
+	audiocap "QqBot/internal/capabilities/audio"
+	videocap "QqBot/internal/capabilities/video"
+	"QqBot/internal/capabilities/vision"
+	"QqBot/internal/common"
+	"QqBot/internal/config"
+	"QqBot/internal/db"
+	"QqBot/internal/llm"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	rootagent "qqbot-ai/internal/agent"
-	"qqbot-ai/internal/capabilities/vision"
-	"qqbot-ai/internal/common"
-	"qqbot-ai/internal/config"
-	"qqbot-ai/internal/db"
-	"qqbot-ai/internal/prompts"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +34,9 @@ type NapcatGateway struct {
 	writeMu  sync.Mutex
 	conn     *websocket.Conn
 	pending  map[string]chan napcatResponse
-	vision   vision.Agent
+	images   ImageMessageAnalyzer
+	audio    AudioMessageAnalyzer
+	videos   VideoMessageAnalyzer
 	stopOnce sync.Once
 	cancel   context.CancelFunc
 }
@@ -47,8 +51,19 @@ type napcatResponse struct {
 }
 
 // NewNapcatGateway 创建一个尚未启动的网关。
-func NewNapcatGateway(cfg *config.Config, store *db.Store, events *rootagent.EventQueue, analyzer vision.Agent) *NapcatGateway {
-	return &NapcatGateway{cfg: cfg, store: store, events: events, pending: map[string]chan napcatResponse{}, vision: analyzer}
+func NewNapcatGateway(cfg *config.Config, store *db.Store, events *rootagent.EventQueue, llmClient *llm.LLMClient) *NapcatGateway {
+	gateway := &NapcatGateway{
+		cfg:     cfg,
+		store:   store,
+		events:  events,
+		pending: map[string]chan napcatResponse{},
+		images:  NewImageMessageAnalyzer(vision.Agent{Client: llmClient}),
+		audio:   NewAudioMessageAnalyzer(audiocap.Agent{Client: llmClient}),
+		videos:  NewVideoMessageAnalyzer(videocap.Agent{Client: llmClient}),
+	}
+	gateway.audio.Log = store.Log
+	gateway.videos.Log = store.Log
+	return gateway
 }
 
 func (g *NapcatGateway) Start(parent context.Context) error {
@@ -95,7 +110,6 @@ func (g *NapcatGateway) connectLoop(ctx context.Context) {
 		g.conn = conn
 		g.mu.Unlock()
 		g.store.Log("info", "NapCat websocket connected", map[string]any{"event": "napcat.gateway.connected", "wsUrl": g.cfg.Server.Napcat.WSURL})
-		go g.hydrateStartupContext(ctx)
 		g.readLoop(ctx, conn)
 		g.mu.Lock()
 		if g.conn == conn {
@@ -107,6 +121,21 @@ func (g *NapcatGateway) connectLoop(ctx context.Context) {
 }
 
 func (g *NapcatGateway) readLoop(ctx context.Context, conn *websocket.Conn) {
+	events := make(chan map[string]any, 256)
+	var workers sync.WaitGroup
+	for range 4 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for payload := range events {
+				g.handleEventSafely(payload)
+			}
+		}()
+	}
+	defer func() {
+		close(events)
+		workers.Wait()
+	}()
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -123,13 +152,24 @@ func (g *NapcatGateway) readLoop(ctx context.Context, conn *websocket.Conn) {
 			g.resolve(echo, resp)
 			continue
 		}
-		g.handleEvent(payload)
 		select {
+		case events <- payload:
 		case <-ctx.Done():
 			return
-		default:
 		}
 	}
+}
+
+func (g *NapcatGateway) handleEventSafely(payload map[string]any) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			g.store.Log("error", "NapCat event handler panicked", map[string]any{
+				"event": "napcat.gateway.event_panic",
+				"panic": fmt.Sprint(recovered),
+			})
+		}
+	}()
+	g.handleEvent(payload)
 }
 
 func (g *NapcatGateway) resolve(echo string, resp napcatResponse) {
@@ -145,21 +185,22 @@ func (g *NapcatGateway) resolve(echo string, resp napcatResponse) {
 func (g *NapcatGateway) Request(action string, params map[string]any) (any, error) {
 	g.mu.Lock()
 	conn := g.conn
+	g.mu.Unlock()
 	if conn == nil {
-		g.mu.Unlock()
 		return nil, fmt.Errorf("NapCat WebSocket 未连接")
 	}
 	echo := common.NewID()
 	ch := make(chan napcatResponse, 1)
+	g.mu.Lock()
 	g.pending[echo] = ch
 	g.mu.Unlock()
 	g.writeMu.Lock()
-	if err := conn.WriteJSON(map[string]any{"action": action, "params": params, "echo": echo}); err != nil {
-		g.writeMu.Unlock()
+	err := conn.WriteJSON(map[string]any{"action": action, "params": params, "echo": echo})
+	g.writeMu.Unlock()
+	if err != nil {
 		g.resolve(echo, napcatResponse{})
 		return nil, err
 	}
-	g.writeMu.Unlock()
 	timeout := time.Duration(g.cfg.Server.Napcat.RequestTimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 10 * time.Second
@@ -182,86 +223,6 @@ func (g *NapcatGateway) Request(action string, params map[string]any) (any, erro
 		g.mu.Unlock()
 		return nil, fmt.Errorf("NapCat 请求超时")
 	}
-}
-
-func (g *NapcatGateway) hydrateStartupContext(ctx context.Context) {
-	select {
-	case <-time.After(1200 * time.Millisecond):
-	case <-ctx.Done():
-		return
-	}
-	g.refreshFriendList()
-	g.hydrateRecentGroupMessages()
-}
-
-func (g *NapcatGateway) refreshFriendList() {
-	data, err := g.Request("get_friend_list", map[string]any{})
-	if err != nil {
-		g.store.Log("warn", "NapCat friend list refresh failed", map[string]any{"event": "napcat.gateway.friend_list_refresh_failed", "error": err.Error()})
-		return
-	}
-	friends := normalizeFriendList(data)
-	if len(friends) == 0 {
-		return
-	}
-	g.events.Enqueue(rootagent.AgentEvent{Type: "napcat_friend_list_updated", Data: map[string]any{"friends": friends}})
-}
-
-func (g *NapcatGateway) hydrateRecentGroupMessages() {
-	count := g.cfg.Server.Napcat.StartupContextRecentMessageCount
-	if count <= 0 {
-		return
-	}
-	for _, groupID := range g.cfg.Server.Napcat.ListenGroupIDs {
-		data, err := g.Request("get_group_msg_history", map[string]any{"group_id": groupID, "count": count})
-		if err != nil {
-			g.store.Log("warn", "NapCat startup group history failed", map[string]any{"event": "agent.startup_context_group_hydrate_failed", "groupId": groupID, "error": err.Error()})
-			continue
-		}
-		messages := normalizeHistoryMessages(data)
-		for _, payload := range messages {
-			payload["message_type"] = "group"
-			payload["group_id"] = groupID
-			if userID := common.AsString(payload["user_id"]); userID != "" && g.cfg.Server.Bot.QQ != "" && userID == g.cfg.Server.Bot.QQ {
-				continue
-			}
-			g.handleHydratedMessage(payload)
-		}
-	}
-}
-
-func (g *NapcatGateway) handleHydratedMessage(payload map[string]any) {
-	messageType := common.AsString(payload["message_type"])
-	if messageType == "" {
-		return
-	}
-	groupID := db.StringPtr(payload["group_id"])
-	userID := db.StringPtr(payload["user_id"])
-	nickname := ""
-	if sender, ok := payload["sender"].(map[string]any); ok {
-		nickname = firstNonEmpty(common.AsString(sender["card"]), common.AsString(sender["nickname"]))
-	}
-	raw := g.renderIncomingMessageWithoutImageAnalysis(payload)
-	if raw == "" {
-		raw = common.AsString(payload["raw_message"])
-	}
-	payload["rendered_message"] = raw
-	messageID := db.IntPtr(payload["message_id"])
-	var eventTime *time.Time
-	if t := db.IntPtr(payload["time"]); t != nil {
-		eventTime = new(time.Unix(int64(*t), 0))
-	}
-	item := db.NapcatMessageItem{MessageType: messageType, SubType: "startup", GroupID: groupID, UserID: userID, Nickname: ptrOrNil(nickname), MessageID: messageID, Message: payload["message"], EventTime: eventTime, Payload: payload}
-	seq := g.store.AddNapcatMessage(item)
-	eventType := "napcat_group_message"
-	if messageType == "private" {
-		eventType = "napcat_private_message"
-	}
-	at := time.Now()
-	if eventTime != nil && !eventTime.IsZero() {
-		at = *eventTime
-	}
-	g.events.Enqueue(rootagent.AgentEvent{Type: eventType, Data: map[string]any{"groupId": deref(groupID), "userId": deref(userID), "nickname": nickname, "rawMessage": raw, "messageId": valueInt(messageID), "messageSeq": seq, "startup": true}, At: at})
 }
 
 func (g *NapcatGateway) SendGroupMessage(groupID, message string) (int, error) {
@@ -290,73 +251,6 @@ func (g *NapcatGateway) SendPrivateMessage(userID, message string) (int, error) 
 	return 0, fmt.Errorf("NapCat 返回结果缺少 message_id")
 }
 
-func (g *NapcatGateway) RecentGroupMessages(groupID string, count int) []string {
-	if count <= 0 {
-		return nil
-	}
-	data, err := g.Request("get_group_msg_history", map[string]any{"group_id": groupID, "count": count})
-	if err != nil {
-		g.store.Log("warn", "NapCat recent group messages failed", map[string]any{"event": "napcat.gateway.recent_group_failed", "groupId": groupID, "error": err.Error()})
-		return nil
-	}
-	return g.renderHistoryMessages(normalizeHistoryMessages(data), "group", groupID)
-}
-
-func (g *NapcatGateway) RecentPrivateMessages(userID string, count int) []string {
-	if count <= 0 {
-		return nil
-	}
-	data, err := g.Request("get_friend_msg_history", map[string]any{"user_id": userID, "count": count})
-	if err != nil {
-		g.store.Log("warn", "NapCat recent private messages failed", map[string]any{"event": "napcat.gateway.recent_private_failed", "userId": userID, "error": err.Error()})
-		return nil
-	}
-	return g.renderHistoryMessages(normalizeHistoryMessages(data), "private", userID)
-}
-
-func (g *NapcatGateway) renderHistoryMessages(items []map[string]any, kind, id string) []string {
-	out := make([]string, 0, len(items))
-	for _, payload := range items {
-		payload["message_type"] = kind
-		if kind == "group" {
-			payload["group_id"] = id
-		} else {
-			payload["user_id"] = id
-		}
-		nickname := "未知用户"
-		if sender, ok := payload["sender"].(map[string]any); ok {
-			nickname = firstNonEmpty(common.AsString(sender["card"]), common.AsString(sender["nickname"]))
-		}
-		userID := common.AsString(payload["user_id"])
-		raw := g.renderIncomingMessageWithoutImageAnalysis(payload)
-		if raw == "" {
-			raw = common.AsString(payload["raw_message"])
-		}
-		if strings.TrimSpace(raw) != "" {
-			out = append(out, prompts.QQMessageAt(nickname, userID, raw, payloadMessageTime(payload)))
-		}
-	}
-	return out
-}
-
-func payloadMessageTime(payload map[string]any) time.Time {
-	switch v := payload["time"].(type) {
-	case int:
-		return time.Unix(int64(v), 0)
-	case int64:
-		return time.Unix(v, 0)
-	case float64:
-		if v > 0 {
-			return time.Unix(int64(v), 0)
-		}
-	case json.Number:
-		if n, err := v.Int64(); err == nil && n > 0 {
-			return time.Unix(n, 0)
-		}
-	}
-	return time.Time{}
-}
-
 func (g *NapcatGateway) handleEvent(payload map[string]any) {
 	postType := common.AsString(payload["post_type"])
 	messageType := db.StringPtr(payload["message_type"])
@@ -365,7 +259,8 @@ func (g *NapcatGateway) handleEvent(payload map[string]any) {
 	groupID := db.StringPtr(payload["group_id"])
 	var eventTime *time.Time
 	if t := db.IntPtr(payload["time"]); t != nil {
-		eventTime = new(time.Unix(int64(*t), 0))
+		tt := time.Unix(int64(*t), 0)
+		eventTime = &tt
 	}
 	g.store.AddNapcatEvent(db.NapcatEventItem{PostType: postType, MessageType: messageType, SubType: subType, UserID: userID, GroupID: groupID, EventTime: eventTime, Payload: payload})
 	if postType != "message" || messageType == nil {
@@ -375,212 +270,583 @@ func (g *NapcatGateway) handleEvent(payload map[string]any) {
 		g.store.Log("info", "NapCat group message ignored by listenGroupIds", map[string]any{"event": "napcat.message.ignored_group", "groupId": *groupID, "listenGroupIds": g.cfg.Server.Napcat.ListenGroupIDs})
 		return
 	}
-	if userID != nil && g.cfg.Server.Bot.QQ != "" && *userID == g.cfg.Server.Bot.QQ {
-		g.store.Log("info", "NapCat self message ignored", map[string]any{"event": "napcat.message.ignored_self", "userId": *userID})
-		return
-	}
 	nickname := ""
 	if sender, ok := payload["sender"].(map[string]any); ok {
 		nickname = common.AsString(sender["nickname"])
 	}
-	raw := g.renderIncomingMessage(payload)
+	segments, raw := g.normalizeMessageSegments(payload, deref(groupID))
 	if raw == "" {
 		raw = common.AsString(payload["raw_message"])
 	}
-	payload["rendered_message"] = raw
 	messageID := db.IntPtr(payload["message_id"])
-	item := db.NapcatMessageItem{MessageType: *messageType, SubType: valueOr(subType, "normal"), GroupID: groupID, UserID: userID, Nickname: ptrOrNil(nickname), MessageID: messageID, Message: payload["message"], EventTime: eventTime, Payload: payload}
+	item := db.NapcatMessageItem{MessageType: *messageType, SubType: valueOr(subType, "normal"), GroupID: groupID, UserID: userID, Nickname: ptrOrNil(nickname), MessageID: messageID, Message: payload["message"], RawMessage: raw, MessageSegments: segments, EventTime: eventTime, Payload: payload}
 	seq := g.store.AddNapcatMessage(item)
 	g.store.Log("info", "NapCat message accepted", map[string]any{"event": "napcat.message.accepted", "messageType": *messageType, "groupId": deref(groupID), "userId": deref(userID), "messageSeq": seq, "rawMessage": raw})
+	if *messageType == "group" && g.isSelfGroupMessage(payload, userID) {
+		g.store.Log("info", "NapCat self group message persisted without publishing to Agent", map[string]any{"event": "napcat.message.self_group_ignored", "groupId": deref(groupID), "userId": deref(userID), "messageSeq": seq})
+		return
+	}
 	eventType := "napcat_group_message"
 	if *messageType == "private" {
 		eventType = "napcat_private_message"
 	}
-	at := time.Now()
-	if eventTime != nil && !eventTime.IsZero() {
-		at = *eventTime
+	event := rootagent.AgentEvent{Type: eventType, Data: map[string]any{"groupId": deref(groupID), "userId": deref(userID), "nickname": nickname, "rawMessage": raw, "messageId": valueInt(messageID), "messageSeq": seq}}
+	if eventTime != nil {
+		event.At = *eventTime
 	}
-	g.events.Enqueue(rootagent.AgentEvent{Type: eventType, Data: map[string]any{"groupId": deref(groupID), "userId": deref(userID), "nickname": nickname, "rawMessage": raw, "messageId": valueInt(messageID), "messageSeq": seq}, At: at})
+	g.events.Enqueue(event)
+}
+
+func (g *NapcatGateway) isSelfGroupMessage(payload map[string]any, userID *string) bool {
+	if userID == nil || *userID == "" {
+		return false
+	}
+	selfID := common.AsString(payload["self_id"])
+	if selfID != "" && selfID == *userID {
+		return true
+	}
+	return strings.TrimSpace(g.cfg.Server.Bot.QQ) != "" && g.cfg.Server.Bot.QQ == *userID
 }
 
 func parseOutgoingMessage(message string) []map[string]any {
-	return []map[string]any{{"type": "text", "data": map[string]any{"text": message}}}
-}
-
-func (g *NapcatGateway) renderIncomingMessage(payload map[string]any) string {
-	return g.renderIncomingMessageWithImageAnalysis(payload, true)
-}
-
-func (g *NapcatGateway) renderIncomingMessageWithoutImageAnalysis(payload map[string]any) string {
-	return g.renderIncomingMessageWithImageAnalysis(payload, false)
-}
-
-func (g *NapcatGateway) renderIncomingMessageWithImageAnalysis(payload map[string]any, analyzeImages bool) string {
-	message, ok := payload["message"].([]any)
-	if !ok || len(message) == 0 {
-		return strings.TrimSpace(common.AsString(payload["raw_message"]))
-	}
-	parts := []string{}
-	for _, item := range message {
-		seg, ok := item.(map[string]any)
-		if !ok {
-			continue
+	segments := []map[string]any{}
+	for len(message) > 0 {
+		start := strings.Index(message, "[CQ:")
+		if start < 0 {
+			if message != "" {
+				segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": message}})
+			}
+			break
 		}
-		typ := common.AsString(seg["type"])
-		data, _ := seg["data"].(map[string]any)
-		switch typ {
+		if start > 0 {
+			segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": message[:start]}})
+		}
+		end := strings.Index(message[start:], "]")
+		if end < 0 {
+			segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": message[start:]}})
+			break
+		}
+		code := message[start+4 : start+end]
+		parts := strings.Split(code, ",")
+		kind := parts[0]
+		data := map[string]any{}
+		for _, part := range parts[1:] {
+			key, value, ok := strings.Cut(part, "=")
+			if ok {
+				data[key] = value
+			}
+		}
+		switch kind {
+		case "at":
+			segments = append(segments, map[string]any{"type": "at", "data": data})
+		case "image":
+			segments = append(segments, map[string]any{"type": "image", "data": data})
+		default:
+			segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": "[CQ:" + code + "]"}})
+		}
+		message = message[start+end+1:]
+	}
+	if len(segments) == 0 {
+		segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": ""}})
+	}
+	return segments
+}
+
+func (g *NapcatGateway) normalizeMessageSegments(payload map[string]any, groupID string) ([]db.MessageSegment, string) {
+	rawSegments := normalizeRawSegments(payload["message"])
+	out := make([]db.MessageSegment, 0, len(rawSegments))
+	var text strings.Builder
+	for _, segment := range rawSegments {
+		kind := common.AsString(segment["type"])
+		data, _ := segment["data"].(map[string]any)
+		if data == nil {
+			data = map[string]any{}
+		}
+		item := db.MessageSegment{Type: kind, Data: data}
+		switch kind {
 		case "text":
-			parts = append(parts, common.AsString(data["text"]))
+			item.Text = common.AsString(data["text"])
 		case "at":
 			qq := common.AsString(data["qq"])
-			if qq == "all" {
-				parts = append(parts, "@全体成员")
-			} else {
-				name := common.AsString(data["name"])
-				if name == "" {
-					name = g.resolveAtName(common.AsString(payload["group_id"]), qq)
-				}
+			name := common.AsString(data["name"])
+			if name == "" && groupID != "" && qq != "" && qq != "all" {
+				name = g.lookupGroupMemberName(groupID, qq)
 				if name != "" {
-					parts = append(parts, "@"+name+"("+qq+")")
-				} else {
-					parts = append(parts, "@"+qq)
+					data["name"] = name
 				}
+			}
+			if qq == "all" {
+				item.Text = "@全体成员"
+			} else if name != "" {
+				item.Text = "@" + name
+			} else {
+				item.Text = "@" + qq
 			}
 		case "reply":
-			id := firstNonEmpty(common.AsString(data["id"]), common.AsString(data["message_id"]))
-			if preview := g.replyPreview(id); preview != "" {
-				parts = append(parts, preview)
-			} else if id != "" {
-				parts = append(parts, "[回复消息:"+id+"]")
+			replyID := common.AsString(data["id"])
+			preview, sender, sentAt := g.lookupReplyPreview(replyID)
+			if preview != "" {
+				data["preview"] = preview
+				data["sender"] = sender
+				data["sentAt"] = sentAt
+				item.Text = "[引用 " + sender
+				if sentAt != "" {
+					item.Text += " " + sentAt
+				}
+				item.Text += ": " + preview + "]"
 			} else {
-				parts = append(parts, "[回复消息]")
+				item.Text = "[引用消息 " + replyID + "]"
+			}
+		case "forward":
+			rendered := g.lookupForwardPreview(data)
+			item.Text = rendered
+			if rendered != "[合并转发]" {
+				data["preview"] = rendered
 			}
 		case "image":
-			desc := firstNonEmpty(common.AsString(data["summary"]), common.AsString(data["file"]), common.AsString(data["url"]))
-			if analyzeImages {
-				if analyzed := g.analyzeImageSegment(data); analyzed != "" {
-					desc = analyzed
+			file := firstNonEmpty(common.AsString(data["file"]), common.AsString(data["url"]))
+			item.Text = "[图片"
+			if file != "" {
+				item.Text += ": " + file
+			}
+			item.Text += "]"
+			if imageURL := g.resolveImageURL(data); imageURL != "" {
+				if strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
+					data["url"] = imageURL
+				} else {
+					data["localFile"] = imageURL
 				}
 			}
-			if desc == "" {
-				desc = "图片"
+			rendered, err := g.images.AnalyzeImageSegmentWithError(context.Background(), data)
+			if err != nil {
+				g.store.Log("warn", "NapCat image understanding failed", map[string]any{
+					"event": "napcat.image.analyze_failed",
+					"file":  common.AsString(data["file"]),
+					"url":   truncateRunes(common.AsString(data["url"]), 180),
+					"error": err.Error(),
+				})
 			}
-			parts = append(parts, "[图片:"+desc+"]")
-		case "face":
-			id := common.AsString(data["id"])
-			if id == "" {
-				parts = append(parts, "[表情]")
-			} else {
-				parts = append(parts, "[表情:"+id+"]")
+			item.Text = rendered
+			if description := extractImageDescription(rendered); description != "" {
+				data["summary"] = description
 			}
-		case "record":
-			parts = append(parts, "[语音]")
+		case "record", "audio":
+			rendered := g.audio.AnalyzeAudioSegment(context.Background(), data)
+			item.Text = rendered
+			if description := extractAudioDescription(rendered); description != "" {
+				data["summary"] = description
+			}
 		case "video":
-			parts = append(parts, "[视频]")
+			rendered := g.videos.AnalyzeVideoSegment(context.Background(), data)
+			item.Text = rendered
+			if description := extractVideoDescription(rendered); description != "" {
+				data["summary"] = description
+			}
 		case "file":
-			name := firstNonEmpty(common.AsString(data["name"]), common.AsString(data["file"]))
-			if name == "" {
-				name = "文件"
+			filename := common.AsString(data["file"])
+			item.Text = "[文件"
+			if filename != "" {
+				item.Text += ": " + filename
 			}
-			parts = append(parts, "[文件:"+name+"]")
+			item.Text += "]"
+			switch mediaKindFromFilename(filename) {
+			case "audio":
+				if fileURL := g.resolveFileURL(groupID, data); fileURL != "" {
+					data["url"] = fileURL
+					rendered := g.audio.AnalyzeAudioSegment(context.Background(), data)
+					item.Text = rendered
+					if description := extractAudioDescription(rendered); description != "" {
+						data["summary"] = description
+					}
+				}
+			case "video":
+				if fileURL := g.resolveFileURL(groupID, data); fileURL != "" {
+					data["url"] = fileURL
+					rendered := g.videos.AnalyzeVideoSegment(context.Background(), data)
+					item.Text = rendered
+					if description := extractVideoDescription(rendered); description != "" {
+						data["summary"] = description
+					}
+				}
+			}
+		case "face":
+			item.Text = "[表情 " + common.AsString(data["id"]) + "]"
 		default:
-			if typ != "" {
-				parts = append(parts, "["+typ+"]")
-			}
+			item.Text = "[" + kind + "]"
+		}
+		text.WriteString(item.Text)
+		out = append(out, item)
+	}
+	return out, strings.TrimSpace(text.String())
+}
+
+func (g *NapcatGateway) resolveImageURL(data map[string]any) string {
+	file := strings.TrimSpace(common.AsString(data["file"]))
+	if file == "" {
+		return ""
+	}
+	if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") || strings.HasPrefix(file, "file://") {
+		return file
+	}
+	if _, err := os.Stat(file); err == nil {
+		return file
+	}
+	result, err := g.Request("get_image", map[string]any{"file": file})
+	if err != nil {
+		g.store.Log("warn", "NapCat image URL resolution failed", map[string]any{
+			"event": "napcat.image.resolve_failed",
+			"file":  file,
+			"error": err.Error(),
+		})
+		return ""
+	}
+	payload, _ := result.(map[string]any)
+	g.store.Log("info", "NapCat get_image result", map[string]any{
+		"event":  "napcat.image.resolve_result",
+		"file":   file,
+		"result": sanitizeNapcatImageResult(payload),
+	})
+	copyImagePayload(data, payload)
+	resolved := preferredNapcatImageRef(payload)
+	if resolved == "" {
+		g.store.Log("warn", "NapCat image resolution returned no path", map[string]any{
+			"event":  "napcat.image.resolve_empty",
+			"file":   file,
+			"result": payload,
+		})
+	}
+	return resolved
+}
+
+func copyImagePayload(data, payload map[string]any) {
+	for _, key := range []string{"base64", "imageBase64", "mimeType", "contentType"} {
+		if value := common.AsString(payload[key]); strings.TrimSpace(value) != "" {
+			data[key] = value
 		}
 	}
-	return strings.TrimSpace(strings.Join(parts, ""))
+	if localFile := existingNapcatImagePath(payload); localFile != "" {
+		data["localFile"] = localFile
+	}
+	if imageURL := strings.TrimSpace(common.AsString(payload["url"])); strings.HasPrefix(imageURL, "http://") || strings.HasPrefix(imageURL, "https://") {
+		data["url"] = imageURL
+	}
 }
 
-func (g *NapcatGateway) resolveAtName(groupID, userID string) string {
-	if groupID == "" || userID == "" {
-		return ""
+func preferredNapcatImageRef(payload map[string]any) string {
+	if localFile := existingNapcatImagePath(payload); localFile != "" {
+		return localFile
 	}
-	data, err := g.Request("get_group_member_info", map[string]any{"group_id": groupID, "user_id": userID, "no_cache": false})
-	if err != nil {
-		return ""
+	if imageURL := strings.TrimSpace(common.AsString(payload["url"])); imageURL != "" {
+		return imageURL
 	}
-	m, ok := data.(map[string]any)
-	if !ok {
-		return ""
-	}
-	return firstNonEmpty(common.AsString(m["card"]), common.AsString(m["nickname"]))
+	return firstNonEmpty(common.AsString(payload["file"]), common.AsString(payload["path"]))
 }
 
-func (g *NapcatGateway) replyPreview(id string) string {
-	if id == "" {
-		return ""
-	}
-	messageID := 0
-	_, _ = fmt.Sscanf(id, "%d", &messageID)
-	if messageID == 0 {
-		return ""
-	}
-	data := g.store.Snapshot()
-	for i := len(data.NapcatMessages) - 1; i >= 0; i-- {
-		msg := data.NapcatMessages[i]
-		if msg.MessageID == nil || *msg.MessageID != messageID {
+func existingNapcatImagePath(payload map[string]any) string {
+	for _, key := range []string{"file", "path"} {
+		candidate := strings.TrimSpace(common.AsString(payload[key]))
+		if candidate == "" {
 			continue
 		}
-		nickname := ""
-		if msg.Nickname != nil {
-			nickname = *msg.Nickname
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
 		}
-		userID := ""
-		if msg.UserID != nil {
-			userID = *msg.UserID
-		}
-		raw := common.AsString(msg.Payload["rendered_message"])
-		if raw == "" {
-			raw = common.AsString(msg.Payload["raw_message"])
-		}
-		if len([]rune(raw)) > 50 {
-			raw = string([]rune(raw)[:50]) + "…"
-		}
-		return fmt.Sprintf("[回复 %s(%s): %s]", nickname, userID, raw)
 	}
 	return ""
 }
 
-func (g *NapcatGateway) analyzeImageSegment(data map[string]any) string {
-	if g.vision.Client == nil {
+func sanitizeNapcatImageResult(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := map[string]any{}
+		for key, item := range v {
+			out[key] = sanitizeNapcatImageResultField(key, item)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, sanitizeNapcatImageResult(item))
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func sanitizeNapcatImageResultField(key string, value any) any {
+	text := common.AsString(value)
+	if strings.Contains(strings.ToLower(key), "base64") && text != "" {
+		return map[string]any{"base64BytesApprox": len(text) * 3 / 4}
+	}
+	if text != "" {
+		return truncateRunes(text, 500)
+	}
+	return sanitizeNapcatImageResult(value)
+}
+
+func (g *NapcatGateway) resolveFileURL(groupID string, data map[string]any) string {
+	fileID := common.AsString(data["file_id"])
+	if fileID == "" {
 		return ""
 	}
-	url := common.AsString(data["url"])
-	if url == "" {
+	action := "get_private_file_url"
+	params := map[string]any{"file_id": fileID}
+	if groupID != "" {
+		action = "get_group_file_url"
+		params["group_id"] = groupID
+		if busID, ok := data["busid"]; ok {
+			params["busid"] = busID
+		}
+	}
+	result, err := g.Request(action, params)
+	if err != nil {
+		g.store.Log("warn", "NapCat media file URL resolution failed", map[string]any{
+			"event":    "napcat.media_file.resolve_failed",
+			"action":   action,
+			"fileId":   fileID,
+			"filename": common.AsString(data["file"]),
+			"error":    err.Error(),
+		})
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	payload, _ := result.(map[string]any)
+	return strings.TrimSpace(common.AsString(payload["url"]))
+}
+
+func mediaKindFromFilename(filename string) string {
+	filename = strings.ToLower(strings.TrimSpace(filename))
+	switch {
+	case strings.HasSuffix(filename, ".mp3"),
+		strings.HasSuffix(filename, ".wav"),
+		strings.HasSuffix(filename, ".aac"),
+		strings.HasSuffix(filename, ".ogg"),
+		strings.HasSuffix(filename, ".oga"),
+		strings.HasSuffix(filename, ".flac"),
+		strings.HasSuffix(filename, ".aif"),
+		strings.HasSuffix(filename, ".aiff"):
+		return "audio"
+	case strings.HasSuffix(filename, ".mp4"),
+		strings.HasSuffix(filename, ".mpeg"),
+		strings.HasSuffix(filename, ".mpe"),
+		strings.HasSuffix(filename, ".mov"),
+		strings.HasSuffix(filename, ".avi"),
+		strings.HasSuffix(filename, ".flv"),
+		strings.HasSuffix(filename, ".mpg"),
+		strings.HasSuffix(filename, ".webm"),
+		strings.HasSuffix(filename, ".wmv"),
+		strings.HasSuffix(filename, ".3gp"),
+		strings.HasSuffix(filename, ".3gpp"):
+		return "video"
+	default:
+		return ""
+	}
+}
+
+func normalizeRawSegments(value any) []map[string]any {
+	switch x := value.(type) {
+	case []any:
+		out := []map[string]any{}
+		for _, item := range x {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	case string:
+		return []map[string]any{{"type": "text", "data": map[string]any{"text": x}}}
+	default:
+		return nil
+	}
+}
+
+func (g *NapcatGateway) lookupGroupMemberName(groupID, userID string) string {
+	data, err := g.Request("get_group_member_info", map[string]any{"group_id": groupID, "user_id": userID, "no_cache": false})
 	if err != nil {
 		return ""
 	}
-	resp, err := http.DefaultClient.Do(req)
+	m, _ := data.(map[string]any)
+	return firstNonEmpty(common.AsString(m["card"]), common.AsString(m["nickname"]))
+}
+
+func (g *NapcatGateway) lookupReplyPreview(messageID string) (string, string, string) {
+	if messageID == "" {
+		return "", "", ""
+	}
+	data, err := g.Request("get_msg", map[string]any{"message_id": messageID})
 	if err != nil {
-		return ""
+		return "", "", ""
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ""
+	m, _ := data.(map[string]any)
+	sender := ""
+	if sm, ok := m["sender"].(map[string]any); ok {
+		sender = firstNonEmpty(common.AsString(sm["card"]), common.AsString(sm["nickname"]), common.AsString(sm["user_id"]))
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 6<<20))
-	if err != nil || len(body) == 0 {
-		return ""
+	if sender == "" {
+		sender = firstNonEmpty(common.AsString(m["nickname"]), common.AsString(m["user_id"]), "未知用户")
 	}
-	mimeType := resp.Header.Get("Content-Type")
-	if idx := strings.Index(mimeType, ";"); idx >= 0 {
-		mimeType = mimeType[:idx]
+	raw := renderCompactSegments(m["message"], 0)
+	if raw == "" {
+		raw = common.AsString(m["raw_message"])
 	}
-	if mimeType == "" {
-		mimeType = http.DetectContentType(body)
+	raw = truncateRunes(strings.TrimSpace(raw), 240)
+	sentAt := formatMessageTime(m["time"])
+	return raw, sender, sentAt
+}
+
+func (g *NapcatGateway) lookupForwardPreview(data map[string]any) string {
+	if preview := renderForwardNodes(data["content"], 0); preview != "" {
+		return "[合并转发]\n" + truncateRunes(preview, 1800)
 	}
-	desc, err := g.vision.Analyze(ctx, "", []vision.ImagePart{{MimeType: mimeType, Data: body, Filename: common.AsString(data["file"])}})
+	forwardID := firstNonEmpty(common.AsString(data["id"]), common.AsString(data["res_id"]))
+	if forwardID == "" {
+		return "[合并转发]"
+	}
+	result, err := g.Request("get_forward_msg", map[string]any{"message_id": forwardID, "id": forwardID})
 	if err != nil {
-		g.store.Log("warn", "NapCat image analyze failed", map[string]any{"event": "napcat.image.analyze_failed", "error": err.Error()})
+		g.store.Log("warn", "NapCat forward message expansion failed", map[string]any{
+			"event":     "napcat.forward.expand_failed",
+			"forwardId": forwardID,
+			"error":     err.Error(),
+		})
+		return "[合并转发]"
+	}
+	payload, _ := result.(map[string]any)
+	for _, key := range []string{"messages", "message", "content"} {
+		if preview := renderForwardNodes(payload[key], 0); preview != "" {
+			return "[合并转发]\n" + truncateRunes(preview, 1800)
+		}
+	}
+	return "[合并转发]"
+}
+
+func renderForwardNodes(value any, depth int) string {
+	if depth > 2 {
+		return "[嵌套转发]"
+	}
+	items, ok := value.([]any)
+	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(desc)
+	lines := make([]string, 0, min(len(items), 20))
+	for i, raw := range items {
+		if i >= 20 {
+			lines = append(lines, "……其余消息已省略")
+			break
+		}
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if common.AsString(node["type"]) == "node" {
+			if nested, ok := node["data"].(map[string]any); ok {
+				node = nested
+			}
+		}
+		sender := "未知用户"
+		if senderData, ok := node["sender"].(map[string]any); ok {
+			sender = firstNonEmpty(common.AsString(senderData["card"]), common.AsString(senderData["nickname"]), common.AsString(senderData["user_id"]), sender)
+		} else {
+			sender = firstNonEmpty(common.AsString(node["nickname"]), common.AsString(node["name"]), common.AsString(node["user_id"]), sender)
+		}
+		content := node["content"]
+		if content == nil {
+			content = node["message"]
+		}
+		text := renderCompactSegments(content, depth+1)
+		if text == "" {
+			text = strings.TrimSpace(common.AsString(node["raw_message"]))
+		}
+		if text == "" {
+			continue
+		}
+		prefix := sender
+		if sentAt := formatMessageTime(node["time"]); sentAt != "" {
+			prefix += " " + sentAt
+		}
+		lines = append(lines, prefix+": "+truncateRunes(text, 360))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderCompactSegments(value any, depth int) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []any:
+		var text strings.Builder
+		for _, raw := range typed {
+			segment, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			kind := common.AsString(segment["type"])
+			data, _ := segment["data"].(map[string]any)
+			if data == nil {
+				data = map[string]any{}
+			}
+			switch kind {
+			case "text":
+				text.WriteString(common.AsString(data["text"]))
+			case "at":
+				text.WriteString("@" + firstNonEmpty(common.AsString(data["name"]), common.AsString(data["qq"])))
+			case "face":
+				text.WriteString("[表情 " + common.AsString(data["id"]) + "]")
+			case "image":
+				text.WriteString("[图片]")
+			case "record", "audio":
+				text.WriteString("[语音]")
+			case "video":
+				text.WriteString("[视频]")
+			case "file":
+				text.WriteString("[文件: " + common.AsString(data["file"]) + "]")
+			case "reply":
+				text.WriteString("[引用消息]")
+			case "forward":
+				nested := renderForwardNodes(data["content"], depth+1)
+				if nested == "" {
+					text.WriteString("[嵌套转发]")
+				} else {
+					text.WriteString("[嵌套转发: " + strings.ReplaceAll(nested, "\n", "；") + "]")
+				}
+			default:
+				if kind != "" {
+					text.WriteString("[" + kind + "]")
+				}
+			}
+		}
+		return strings.TrimSpace(text.String())
+	default:
+		return ""
+	}
+}
+
+func formatMessageTime(value any) string {
+	seconds := int64(0)
+	switch typed := value.(type) {
+	case float64:
+		seconds = int64(typed)
+	case int:
+		seconds = int64(typed)
+	case int64:
+		seconds = typed
+	case string:
+		if parsed, err := time.Parse(time.RFC3339, typed); err == nil {
+			return parsed.Local().Format("01-02 15:04")
+		}
+	}
+	if seconds <= 0 {
+		return ""
+	}
+	return time.Unix(seconds, 0).Local().Format("01-02 15:04")
+}
+
+func truncateRunes(value string, max int) string {
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:max-1])) + "…"
 }
 
 func firstNonEmpty(values ...string) string {
@@ -588,6 +854,30 @@ func firstNonEmpty(values ...string) string {
 		if strings.TrimSpace(value) != "" {
 			return value
 		}
+	}
+	return ""
+}
+
+func extractImageDescription(rendered string) string {
+	rendered = strings.TrimSpace(rendered)
+	if strings.HasPrefix(rendered, "[图片: ") && strings.HasSuffix(rendered, "]") {
+		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(rendered, "[图片: "), "]"))
+	}
+	return ""
+}
+
+func extractAudioDescription(rendered string) string {
+	rendered = strings.TrimSpace(rendered)
+	if strings.HasPrefix(rendered, "[语音: ") && strings.HasSuffix(rendered, "]") {
+		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(rendered, "[语音: "), "]"))
+	}
+	return ""
+}
+
+func extractVideoDescription(rendered string) string {
+	rendered = strings.TrimSpace(rendered)
+	if strings.HasPrefix(rendered, "[视频: ") && strings.HasSuffix(rendered, "]") {
+		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(rendered, "[视频: "), "]"))
 	}
 	return ""
 }
@@ -627,46 +917,4 @@ func contains(items []string, value string) bool {
 		}
 	}
 	return false
-}
-
-func normalizeFriendList(data any) []map[string]any {
-	items := dataArray(data)
-	out := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		userID := firstNonEmpty(common.AsString(item["user_id"]), common.AsString(item["userId"]))
-		if userID == "" {
-			continue
-		}
-		out = append(out, map[string]any{
-			"userId":   userID,
-			"nickname": firstNonEmpty(common.AsString(item["nickname"]), common.AsString(item["nick"])),
-			"remark":   common.AsString(item["remark"]),
-		})
-	}
-	return out
-}
-
-func normalizeHistoryMessages(data any) []map[string]any {
-	if m, ok := data.(map[string]any); ok {
-		for _, key := range []string{"messages", "message", "data"} {
-			if items := dataArray(m[key]); len(items) > 0 {
-				return items
-			}
-		}
-	}
-	return dataArray(data)
-}
-
-func dataArray(data any) []map[string]any {
-	items, ok := data.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			out = append(out, m)
-		}
-	}
-	return out
 }

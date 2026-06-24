@@ -1,10 +1,10 @@
 package story
 
 import (
+	"QqBot/internal/config"
+	"QqBot/internal/db"
+	"QqBot/internal/embedding"
 	"context"
-	"qqbot-ai/internal/config"
-	"qqbot-ai/internal/db"
-	"qqbot-ai/internal/embedding"
 	"strings"
 )
 
@@ -32,8 +32,7 @@ func (i *MemoryIndexer) ReindexStory(ctx context.Context, item db.StoryItem) err
 	if i == nil || i.client == nil {
 		return nil
 	}
-	content := parseStoryContent(item)
-	docs := buildStoryMemoryDocuments(content)
+	docs := BuildMemoryDocumentsForStory(item)
 	indexed := make([]db.StoryMemoryDocument, 0, len(docs))
 	for _, doc := range docs {
 		resp, err := i.client.Embed(ctx, embedding.Request{

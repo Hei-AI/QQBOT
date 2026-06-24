@@ -1,89 +1,106 @@
 package db
 
 import (
-	"fmt"
+	"QqBot/internal/agentruntime"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestSQLiteStoreRoundTrip(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
-	if err != nil {
-		t.Fatalf("OpenStore() error = %v", err)
-	}
-	defer store.Close()
-
-	store.Log("info", "hello", map[string]any{"x": "y"})
-	store.AddLlmCall(LlmCallItem{RequestID: "r1", Seq: 1, Provider: "p", Model: "m", Status: "success"})
-	msgID := store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("123"), UserID: StringPtr("456"), Message: "hi"})
-	if msgID == 0 {
-		t.Fatalf("AddNapcatMessage() returned zero id")
-	}
-	seq := store.AddStoryLedger("root", "user", "event")
-	if seq == 0 {
-		t.Fatalf("AddStoryLedger() returned zero seq")
-	}
-
-	store.AddStory(StoryItem{ID: "s1", Markdown: "# story", UpdatedAt: time.Now()})
-	store.SaveAgentSnapshot("root", map[string]any{"ok": true})
-
-	article, created := store.UpsertNewsArticle(NewsArticle{SourceKey: "ithome", UpstreamID: "1", Title: "old"})
-	if !created || article.ID == 0 {
-		t.Fatalf("first UpsertNewsArticle() = (%+v, %v), want created with id", article, created)
-	}
-	article, created = store.UpsertNewsArticle(NewsArticle{SourceKey: "ithome", UpstreamID: "1", Title: "new"})
-	if created || article.Title != "new" {
-		t.Fatalf("second UpsertNewsArticle() = (%+v, %v), want update", article, created)
-	}
-
-	var snapshot map[string]any
-	if !store.LoadAgentSnapshot("root", &snapshot) || snapshot["ok"] != true {
-		t.Fatalf("LoadAgentSnapshot() = %#v", snapshot)
-	}
-
-	data := store.Snapshot()
-	if len(data.AppLogs) != 1 || len(data.LlmCalls) != 1 || len(data.NapcatMessages) != 1 || len(data.StoryLedger) != 1 || len(data.Stories) != 1 || len(data.NewsArticles) != 1 {
-		t.Fatalf("unexpected snapshot counts: %+v", data)
-	}
-	if count := store.CountStoryLedgerAfter("root", 0); count != 1 {
-		t.Fatalf("CountStoryLedgerAfter() = %d, want 1", count)
-	}
-	if latest, ok := store.LatestStoryLedger("root"); !ok || latest.Seq != seq {
-		t.Fatalf("LatestStoryLedger() = (%+v, %v), want seq %d", latest, ok, seq)
-	}
-}
-
-func TestStorePrunesProcessedStoryLedgerTail(t *testing.T) {
+func TestStoryLedgerQueriesIgnoreLegacyInternalMessages(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	for i := 0; i < 8; i++ {
-		store.AddStoryLedger("root", "user", fmt.Sprintf("message-%d", i))
+
+	seq := store.AddStoryLedger("root", "user", "<qq_message>真实消息</qq_message>")
+	store.AppendLedger("root", agentruntime.Message{Role: "assistant", Content: "内部等待"})
+	if got := store.CountStoryLedgerAfter("root", 0); got != 1 {
+		t.Fatalf("legacy internal messages must not count as story input: %d", got)
 	}
-	store.PruneStoryLedgerThrough("root", 6, 2)
-	items := store.ListStoryLedgerAfter("root", 0, 0)
-	if len(items) != 4 {
-		t.Fatalf("got %d ledger items, want processed tail 2 plus pending 2", len(items))
+	latest, ok := store.LatestStoryLedger("root")
+	if !ok || latest.Seq != seq || latest.Content != "<qq_message>真实消息</qq_message>" {
+		t.Fatalf("unexpected latest story ledger item: %#v ok=%v", latest, ok)
 	}
-	if items[0].Seq != 5 || items[3].Seq != 8 {
-		t.Fatalf("unexpected ledger tail: %#v", items)
+	items := store.ListStoryLedgerAfter("root", 0, 10)
+	if len(items) != 1 || items[0].Seq != seq {
+		t.Fatalf("unexpected story ledger items: %#v", items)
 	}
 }
 
-func TestStoreRecentNapcatMessagesFiltersConversation(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
+func TestStringPtrPreservesIntegerTrailingZero(t *testing.T) {
+	got := StringPtr(float64(562223500))
+	if got == nil {
+		t.Fatal("expected string pointer")
+	}
+	if *got != "562223500" {
+		t.Fatalf("expected trailing zero to be preserved, got %q", *got)
+	}
+}
+
+func TestNewsFeedCursorListsNewArticlesAndAdvances(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "store.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("1"), UserID: StringPtr("u1"), Message: "old"})
-	store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("2"), UserID: StringPtr("u2"), Message: "other"})
-	store.AddNapcatMessage(NapcatMessageItem{MessageType: "group", GroupID: StringPtr("1"), UserID: StringPtr("u1"), Message: "new"})
-	items := store.RecentNapcatMessages("group", "1", 2)
-	if len(items) != 2 || items[0].Message != "old" || items[1].Message != "new" {
-		t.Fatalf("unexpected recent messages: %#v", items)
+
+	base := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	store.AddNewsArticle(NewsArticle{ID: 1, SourceKey: "ithome", Title: "old", PublishedAt: base})
+	store.AddNewsArticle(NewsArticle{ID: 2, SourceKey: "ithome", Title: "same-newer-id", PublishedAt: base})
+	store.AddNewsArticle(NewsArticle{ID: 3, SourceKey: "ithome", Title: "new", PublishedAt: base.Add(time.Hour)})
+	store.AddNewsArticle(NewsArticle{ID: 4, SourceKey: "other", Title: "ignored", PublishedAt: base.Add(2 * time.Hour)})
+
+	store.UpsertNewsFeedCursor("ithome", 1, base)
+	cursor, ok := store.NewsFeedCursor("ithome")
+	if !ok {
+		t.Fatal("expected cursor")
+	}
+	if got := store.CountNewsArticlesNewerThanCursor("ithome", cursor); got != 2 {
+		t.Fatalf("unexpected new article count: %d", got)
+	}
+	items := store.ListNewsArticlesNewerThanCursor("ithome", cursor, 10)
+	if len(items) != 2 || items[0].ID != 3 || items[1].ID != 2 {
+		t.Fatalf("unexpected new articles: %#v", items)
+	}
+	store.UpsertNewsFeedCursor("ithome", items[0].ID, items[0].PublishedAt)
+	cursor, _ = store.NewsFeedCursor("ithome")
+	if got := store.CountNewsArticlesNewerThanCursor("ithome", cursor); got != 0 {
+		t.Fatalf("expected cursor to mark feed read, got %d new articles", got)
+	}
+}
+
+func TestStoryTimesAreFilledAndRepaired(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.sqlite")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.AddStory(StoryItem{ID: "20260606102319.868609100", Markdown: "# story"})
+	item := store.Snapshot().Stories[0]
+	if item.CreatedAt.IsZero() || item.UpdatedAt.IsZero() {
+		t.Fatalf("expected story timestamps, got %#v", item)
+	}
+	zero := StoryItem{ID: item.ID, Markdown: item.Markdown}
+	if _, err := store.db.Exec(
+		`UPDATE stories SET updated_at = ?, item = ? WHERE id = ?`,
+		formatTime(time.Time{}),
+		mustJSON(zero),
+		item.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	store, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	item = store.Snapshot().Stories[0]
+	want := time.Date(2026, 6, 6, 10, 23, 19, 868609100, time.Local)
+	if !item.CreatedAt.Equal(want) {
+		t.Fatalf("expected timestamp inferred from story id %v, got %v", want, item.CreatedAt)
 	}
 }

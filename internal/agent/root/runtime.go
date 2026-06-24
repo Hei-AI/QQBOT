@@ -5,10 +5,12 @@ import (
 	"sync"
 	"time"
 
-	"qqbot-ai/internal/agent/context"
-	"qqbot-ai/internal/agentruntime"
+	"QqBot/internal/agent/context"
+	"QqBot/internal/agentruntime"
 )
 
+// Runtime 是 TS RootLoopAgent 在 Go 中的对应实现。
+//
 // 它会把事件写入上下文，执行一轮 ReAct，保存助手和工具
 // 消息，并向运维页面暴露仪表盘快照。
 type Runtime struct {
@@ -58,7 +60,7 @@ func (r *Runtime) RunOnce(ctx context.Context) error {
 	r.mu.Lock()
 	r.LoopState = "calling_llm"
 	r.mu.Unlock()
-	result, err := r.Kernel.RunRound(ctx, agentruntime.RoundInput{SystemPrompt: system, Messages: messages, Tools: r.Tools, ToolChoice: "auto"})
+	result, err := r.Kernel.RunRound(ctx, agentruntime.RoundInput{SystemPrompt: system, Messages: messages, Tools: r.Tools, ToolChoice: "required"})
 	if err != nil {
 		r.mu.Lock()
 		r.LastError = err.Error()

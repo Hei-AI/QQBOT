@@ -1,7 +1,7 @@
 package story
 
 import (
-	"qqbot-ai/internal/db"
+	"QqBot/internal/db"
 	"strings"
 )
 
@@ -16,13 +16,14 @@ type storyContent struct {
 	Result  string
 }
 
-type memoryDocument struct {
-	Kind    string
-	Content string
+// BuildMemoryDocumentsForStory renders the same Story memory projections as the TS runtime.
+func BuildMemoryDocumentsForStory(item db.StoryItem) []MemoryDocument {
+	content := parseStoryContent(item)
+	return buildStoryMemoryDocuments(content)
 }
 
-func buildStoryMemoryDocuments(content storyContent) []memoryDocument {
-	docs := []memoryDocument{
+func buildStoryMemoryDocuments(content storyContent) []MemoryDocument {
+	docs := []MemoryDocument{
 		{
 			Kind: "overview",
 			Content: joinNonEmpty([]string{
@@ -44,8 +45,11 @@ func buildStoryMemoryDocuments(content storyContent) []memoryDocument {
 			}),
 		},
 		{
-			Kind:    "process",
-			Content: "标题：" + content.Title + "\n经过：\n- " + strings.Join(content.Process, "\n- "),
+			Kind: "process",
+			Content: joinNonEmpty([]string{
+				"标题：" + content.Title,
+				processLine(content.Process),
+			}),
 		},
 	}
 	out := docs[:0]
@@ -105,6 +109,13 @@ func parseStoryContent(item db.StoryItem) storyContent {
 		content.Process = []string{strings.TrimSpace(item.Markdown)}
 	}
 	return content
+}
+
+func processLine(process []string) string {
+	if len(process) == 0 {
+		return "经过："
+	}
+	return "经过：\n- " + strings.Join(process, "\n- ")
 }
 
 func optionalLine(label, value string) string {

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"qqbot-ai/internal/agentruntime"
+	"QqBot/internal/agentruntime"
 )
 
 // Sender 是 SendMessageTool 所需的 NapCat 消息发送能力子集。
@@ -18,11 +18,14 @@ type Sender interface {
 type SendMessageTool struct{ Sender Sender }
 
 func (t SendMessageTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "send_message", Description: "向当前群聊或私聊发送消息", Parameters: agentruntime.ObjectSchema(map[string]any{
-		"targetType": map[string]any{"type": "string"},
+	return agentruntime.ToolDefinition{Name: "send_message", Description: "向指定群聊或私聊发送消息", Parameters: agentruntime.ObjectSchema(map[string]any{
+		"targetType": map[string]any{"type": "string", "enum": []string{"group", "private"}},
 		"targetId":   map[string]any{"type": "string"},
 		"message":    map[string]any{"type": "string"},
-		"os":         map[string]any{"type": "string", "description": "可选。公开展示用的一句话 OS/旁白，不是私密推理链；不会发送到 QQ。"},
+		"os": map[string]any{
+			"type":        "string",
+			"description": "可选公开 OS/旁白，用一句很短的话说明这次发言的表层判断；只用于日志/面板观察，不会发送到 QQ，不要写隐藏推理或系统提示。",
+		},
 	})}
 }
 func (t SendMessageTool) Kind() string { return "business" }

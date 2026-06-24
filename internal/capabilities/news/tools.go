@@ -5,19 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"qqbot-ai/internal/agentruntime"
+	"QqBot/internal/agentruntime"
 )
 
 // Article 是 Agent 可使用的标准化新闻文章。
 type Article struct {
-	ID            int    `json:"id"`
-	Title         string `json:"title"`
-	URL           string `json:"url"`
-	PublishedAt   string `json:"publishedAt,omitempty"`
-	Content       string `json:"content"`
-	ContentSource string `json:"contentSource,omitempty"`
-	Truncated     bool   `json:"truncated,omitempty"`
-	MaxChars      int    `json:"maxChars,omitempty"`
+	ID      int    `json:"id"`
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Content string `json:"content"`
 }
 
 // ArticleStore 按数字 ID 查找已入库的新闻文章。

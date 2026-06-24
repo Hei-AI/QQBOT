@@ -19,40 +19,37 @@ type PortalTarget struct {
 	Kind             string
 	HasEntered       bool
 	UnreadCount      int
-	Summary          string
 	EnterCommandText string
 }
 
 func QQMessage(nickname, userID, messageBody string) string {
+	return QQMessageAt(nickname, userID, messageBody, time.Time{})
+}
+
+func QQMessageAt(nickname, userID, messageBody string, eventTime time.Time) string {
 	return fmt.Sprintf(`<qq_message>
 %s (%s):
 %s
 </qq_message>`, nickname, userID, messageBody)
 }
 
-func QQMessageAt(nickname, userID, messageBody string, t time.Time) string {
-	if t.IsZero() {
-		return QQMessage(nickname, userID, messageBody)
+func QQMessageRoutedAt(targetType, targetID, nickname, userID, messageBody string, eventTime time.Time) string {
+	timeAttribute := ""
+	if !eventTime.IsZero() {
+		timeAttribute = fmt.Sprintf(` time="%s"`, eventTime.Format(time.RFC3339))
 	}
-	bt := t
-	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
-		bt = t.In(loc)
-	}
-	return fmt.Sprintf(`<qq_message time="%s">
+	return fmt.Sprintf(`<qq_message target_type="%s" target_id="%s"%s>
 %s (%s):
 %s
-</qq_message>`, bt.Format("2006-01-02 15:04:05 -07:00"), nickname, userID, messageBody)
+</qq_message>`, targetType, targetID, timeAttribute, nickname, userID, messageBody)
 }
 
-func SelfQQMessageAt(nickname, userID, messageBody string, t time.Time) string {
-	bt := t
-	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
-		bt = t.In(loc)
+func QQMessageWithContext(nickname, userID, messageBody, messageType, groupID string) string {
+	targetID := groupID
+	if messageType == "private" {
+		targetID = userID
 	}
-	return fmt.Sprintf(`<qq_message time="%s" self="true">
-%s (%s):
-%s
-</qq_message>`, bt.Format("2006-01-02 15:04:05 -07:00"), nickname, userID, messageBody)
+	return QQMessageRoutedAt(messageType, targetID, nickname, userID, messageBody, time.Time{})
 }
 
 func ConversationSummary(summary string) string {
@@ -62,39 +59,82 @@ func ConversationSummary(summary string) string {
 }
 
 func WakeReminder(t time.Time) string {
-	bt := beijingTime(t)
-	return fmt.Sprintf(`<system_reminder kind="time" time="%s">
-current_time: %s
-timezone: Asia/Shanghai
-</system_reminder>`, bt.Format("2006-01-02 15:04:05 -07:00"), bt.Format("2006-01-02 15:04"))
+	t = t.In(time.FixedZone("Asia/Shanghai", 8*60*60))
+	return fmt.Sprintf(`<system_reminder>当前时间为北京时间 %d 年 %d 月 %d 日 %02d:%02d</system_reminder>`,
+		t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute())
+}
+
+func SelfContinuationReminder() string {
+	return `<system_reminder kind="self_continuation">
+外界暂时安静，没有新的 QQ 消息、新闻或任务通知，现在是你自己的时间。
+先看看刚才是否有真正没做完的事情；有就继续一个明确步骤，也可以使用现有工具探索值得了解的内容。
+如果没有值得做的事，直接调用 wait。不要为了显得忙而重复搜索、重复发言或制造无意义任务。
+只有确实有值得分享的内容时才向 QQ 发消息，不要仅因为这条提醒主动刷屏。
+</system_reminder>`
+}
+
+type StateReminderChild struct {
+	ID          string
+	DisplayName string
+	Description string
+}
+
+type StateReminderApp struct {
+	ID          string
+	DisplayName string
+}
+
+func StateSystemReminder(displayName string, children []StateReminderChild, apps []StateReminderApp) string {
+	var b strings.Builder
+	b.WriteString("<system_reminder>\n")
+	if len(children) > 0 {
+		fmt.Fprintf(&b, "你进入了 %s 节点，有以下子节点可进入：\n", displayName)
+		for _, child := range children {
+			fmt.Fprintf(&b, "- %s (%s): %s\n", child.DisplayName, child.ID, child.Description)
+		}
+	} else {
+		fmt.Fprintf(&b, "你进入了 %s 节点\n", displayName)
+	}
+	if len(apps) > 0 {
+		b.WriteString("也可以进入以下 App：\n")
+		for _, app := range apps {
+			fmt.Fprintf(&b, "- %s：%s\n", app.ID, app.DisplayName)
+		}
+	}
+	b.WriteString("</system_reminder>")
+	return b.String()
+}
+
+func AssistantActionRequiredReminder(content string) string {
+	return fmt.Sprintf(`<system_reminder>
+你刚才只输出了文本，但没有执行任何动作，因此这段内容不会发送到 QQ：
+%s
+
+如果要回复当前 QQ 对话，必须调用 send_message 或 invoke(tool="send_message", arguments={"message":"..."}).
+如果不需要处理，调用 wait。
+</system_reminder>`, strings.TrimSpace(content))
 }
 
 func EnterZoneOutInstruction() string {
-	return `<system_instruction>
-你已进入神游状态。
-现在不能看群消息，也不能直接搜索或发群消息；如果要继续思考，请调用 invoke(tool="zone_out", thought="...")，如果想回到上一级状态，调用 back。
-</system_instruction>`
+	return ""
 }
 
 func ExitZoneOutInstruction() string {
-	return `<system_instruction>
-你已结束神游，回到门户状态。
-如需进入某个目标，请调用 enter。
-</system_instruction>`
+	return ""
 }
 
 func WaitResumeReminder(isTimeout, isEvent bool, resumedStateLabel, eventSummary string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, `<system_reminder kind="wait_resume" time="%s">`+"\n", beijingTime(time.Now()).Format("2006-01-02 15:04:05 -07:00"))
+	b.WriteString("<system_reminder>\n")
 	if isTimeout {
-		b.WriteString("reason: timeout\n")
+		b.WriteString("等待自然结束了。\n")
 	}
 	if isEvent {
-		b.WriteString("reason: event\n")
+		b.WriteString("等待被新的外部事件打断了。\n")
 	}
-	fmt.Fprintf(&b, "resumed_state: %s\n", resumedStateLabel)
+	fmt.Fprintf(&b, "你现在已回到：%s。\n", resumedStateLabel)
 	if strings.TrimSpace(eventSummary) != "" {
-		fmt.Fprintf(&b, "event_summary: %s\n", eventSummary)
+		fmt.Fprintf(&b, "打断等待的事件：%s。\n", eventSummary)
 	}
 	b.WriteString("</system_reminder>")
 	return b.String()
@@ -112,6 +152,23 @@ func WebSearchInstruction(question string) string {
 </system_instruction>`, question)
 }
 
+func BrowserInstruction(task, startURL, sessionID string) string {
+	return fmt.Sprintf(`<system_instruction>
+你正在继承主 agent 当前上下文，临时执行一次真实浏览器子任务。
+本轮只负责操作网页并把可靠结果交还主 agent，不直接向 QQ 发消息。
+任务：%s
+起始 URL：%s
+浏览器会话：%s
+
+先根据任务决定是否打开起始 URL 或搜索。每次页面发生明显变化后用 browser_read 获取最新正文和元素 ref。
+点击、输入、翻页、等待、截图与媒体控制都必须通过浏览器工具完成，不要声称执行了未实际执行的操作。
+需要理解直播、视频画面或纯视觉界面时使用 browser_screenshot(mode="analyze")。
+需要把截图交给主 Agent 发送到 QQ 时使用 mode="send"；既要识图又要发送时使用 mode="both"。
+需要发送时，finalize_browser 必须原样携带截图工具返回的 metadata.imagePath；不要把 Base64 放进摘要。
+取得结果后调用 finalize_browser；除非用户明确要求关闭，否则保留会话以便后续继续操作。
+</system_instruction>`, task, startURL, sessionID)
+}
+
 func ITHomeArticleListInstruction(displayName string, isNewMode bool, hiddenNewCount int, articles []ArticleSummary) string {
 	var b strings.Builder
 	b.WriteString("<system_instruction>\n")
@@ -124,13 +181,28 @@ func ITHomeArticleListInstruction(displayName string, isNewMode bool, hiddenNewC
 	} else {
 		b.WriteString("以下是最近文章列表。\n")
 	}
-	b.WriteString("如果想阅读全文，调用 invoke(tool=\"open_ithome_article\", articleId=...)；如果想离开，调用 back。\n")
+	b.WriteString("如果想阅读全文，直接调用 open_ithome_article(articleId=...) 或 invoke(tool=\"open_ithome_article\", articleId=...)。\n")
 	b.WriteString("</system_instruction>\n<ithome_article_list>\n")
 	for _, article := range articles {
 		fmt.Fprintf(&b, "[%d] %s\n发布时间：%s\n链接：%s\n摘要：%s\n\n",
 			article.ID, article.Title, article.PublishedAtText, article.URL, article.RSSSummary)
 	}
 	b.WriteString("</ithome_article_list>")
+	return b.String()
+}
+
+func ITHomeArticleIngestedNotice(article ArticleSummary) string {
+	var b strings.Builder
+	b.WriteString("<system_reminder>\n")
+	fmt.Fprintf(&b, "IT 之家有新文章：[%d] %s\n", article.ID, article.Title)
+	if article.PublishedAtText != "" {
+		fmt.Fprintf(&b, "发布时间：%s\n", article.PublishedAtText)
+	}
+	if article.URL != "" {
+		fmt.Fprintf(&b, "链接：%s\n", article.URL)
+	}
+	b.WriteString("如需阅读正文，直接调用 open_ithome_article，并可同时继续处理 QQ 聊天。\n")
+	b.WriteString("</system_reminder>")
 	return b.String()
 }
 
@@ -155,80 +227,65 @@ func ITHomeArticleDetail(title, publishedAtText, url, content string, fallbackTo
 	return b.String()
 }
 
-func PortalSnapshot(groups, privates, feeds []PortalTarget) string {
+func PortalSnapshot(groups, feeds []PortalTarget) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, `<system_reminder kind="state" time="%s">`+"\n", beijingTime(time.Now()).Format("2006-01-02 15:04:05 -07:00"))
-	b.WriteString("current_state: portal\n")
-	b.WriteString("allowed_tools: enter, wait\n")
-	b.WriteString("instruction: choose one target to enter, or wait.\n")
-	b.WriteString("available_targets:\n")
+	b.WriteString("<system_reminder>\n你当前处于门户状态。\n这里会显示可进入的目标；如果你想进入某个目标，调用 enter。\n可进入目标：\n")
 	for _, group := range groups {
-		fmt.Fprintf(&b, "- label: %s\n  type: qq_group\n  unread: %d\n  enter: %s\n", group.Label, group.UnreadCount, group.EnterCommandText)
-		if strings.TrimSpace(group.Summary) != "" {
-			fmt.Fprintf(&b, "  latest: %s\n", group.Summary)
-		}
-		if group.UnreadCount > 0 {
-			fmt.Fprintf(&b, "  status: unread\n")
-		} else if group.HasEntered {
-			fmt.Fprintf(&b, "  status: entered\n")
+		fmt.Fprintf(&b, "- %s", group.Label)
+		if group.HasEntered {
+			fmt.Fprintf(&b, "，未读 %d 条，可通过 %s 进入\n", group.UnreadCount, group.EnterCommandText)
 		} else {
-			fmt.Fprintf(&b, "  status: not_entered\n")
-		}
-	}
-	for _, private := range privates {
-		fmt.Fprintf(&b, "- label: %s\n  type: qq_private\n  unread: %d\n  enter: %s\n", private.Label, private.UnreadCount, private.EnterCommandText)
-		if strings.TrimSpace(private.Summary) != "" {
-			fmt.Fprintf(&b, "  latest: %s\n", private.Summary)
-		}
-		if private.UnreadCount > 0 {
-			fmt.Fprintf(&b, "  status: unread\n")
-		} else if private.HasEntered {
-			fmt.Fprintf(&b, "  status: entered\n")
-		} else {
-			fmt.Fprintf(&b, "  status: not_entered\n")
+			fmt.Fprintf(&b, "，尚未查看，可通过 %s 进去看看最近消息\n", group.EnterCommandText)
 		}
 	}
 	for _, feed := range feeds {
-		fmt.Fprintf(&b, "- label: %s\n  type: feed\n  kind: %s\n  unread: %d\n  enter: %s\n", feed.Label, feed.Kind, feed.UnreadCount, feed.EnterCommandText)
-		if feed.UnreadCount > 0 {
-			fmt.Fprintf(&b, "  status: unread\n")
-		} else if feed.HasEntered {
-			fmt.Fprintf(&b, "  status: entered\n")
+		fmt.Fprintf(&b, "- %s(kind=\"%s\")", feed.Label, feed.Kind)
+		if feed.HasEntered {
+			if feed.UnreadCount > 0 {
+				fmt.Fprintf(&b, "，新文章 %d 篇，可通过 %s 进入\n", feed.UnreadCount, feed.EnterCommandText)
+			} else {
+				fmt.Fprintf(&b, "，暂无新文章，可通过 %s 进去看看最近文章\n", feed.EnterCommandText)
+			}
 		} else {
-			fmt.Fprintf(&b, "  status: not_entered\n")
+			fmt.Fprintf(&b, "，尚未查看，可通过 %s 进去看看最近文章\n", feed.EnterCommandText)
 		}
 	}
-	b.WriteString("- label: 神游\n  type: zone_out\n  enter: enter(id=\"zone_out\")\n  status: available\n")
 	b.WriteString("</system_reminder>")
 	return b.String()
 }
 
-func beijingTime(t time.Time) time.Time {
-	if t.IsZero() {
-		t = time.Now()
-	}
-	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
-		return t.In(loc)
-	}
-	return t
-}
-
 func RootContextSummaryReminder() string {
-	return `<system_reminder kind="context_summary_task">
+	return `<system_reminder>
 你现在不是在继续执行动作，而是在为当前 root agent 整理“稍后继续接上”的累计上下文摘要。
 这份摘要不是状态面板，也不是任务汇报，而是同一个人中途离开后回来继续延续当下局面的工作记忆。
-请优先保留上下文压缩后最容易丢失、但最影响后续自然延续的内容：跨轮仍成立的背景，当前仍在延续的线索，关键对象，帕秋莉自己的感觉与倾向，已经做过的关键动作及结果，以及后续还可以继续展开的点。
-摘要使用 Markdown 二级标题，按固定顺序组织为：## 持续背景、## 仍在延续的线索、## 关键对象、## 帕秋莉这边的感觉与倾向、## 已做动作与结果、## 还可以继续展开的点。
-不要直接输出自由文本回复，必须调用 summary 工具；summary 参数应是简洁但信息完整的中文字符串。
+不要重点记录当前正处于哪个状态、眼前有哪些入口、刚进入了哪里。
+这些信息会随着后续状态切换和系统提醒重新出现，不属于累计摘要最该保留的内容。
+请优先保留那些在上下文压缩后最容易丢失、但最影响后续自然延续的内容：
+跨轮仍成立的背景，当前仍在延续的线索，关键对象，帕秋莉自己的感觉与倾向，已经做过的关键动作及结果，以及后续还可以继续展开的点。
+摘要使用 Markdown 二级标题，按固定顺序组织为：` + "`## 当前任务现场`、`## 持续背景`、`## 仍在延续的线索`、`## 关键对象`、`## 帕秋莉这边的感觉与倾向`、`## 已做动作与结果`、`## 还可以继续展开的点`" + `。
+` + "`## 当前任务现场`" + ` 是最高优先级：明确写出压缩发生前正在做什么、已经做到哪一步、下一步准备做什么、正在使用的工具或会话 ID。若详细资料已保存到文件，必须写出准确路径以及恢复工作时的读取方式；没有进行中的任务时写“无”。
+` + "`## 持续背景`" + ` 保留跨轮仍重要的事实、关系、承诺、约束、长期判断。
+` + "`## 仍在延续的线索`" + ` 保留当前还没完的事情，可以是聊天话题、阅读线索、论坛讨论、游戏目标、判断链或其他活动；写清它最近推进到了哪。
+` + "`## 关键对象`" + ` 按“为什么现在仍重要”来写，可以包括人、群、文章、帖子、事件、问题、目标或别的关键对象。
+` + "`## 帕秋莉这边的感觉与倾向`" + ` 写帕秋莉更想接什么、不想接什么、对哪些方向更有兴趣、哪些方向更自然、哪些方向让人烦、尴尬或懒得接。
+` + "`## 已做动作与结果`" + ` 只记录有语义后果的动作与结果，例如已经搜索、已经阅读、已经说过什么、已经获得了什么信息；不要机械记录纯状态切换。
+` + "`## 还可以继续展开的点`" + ` 保留 1 到 3 个最自然能继续的点，可包含极短原话或极短线索摘录。
+忽略寒暄、纯重复内容、已经失效的瞬时界面信息和明显无关细节。
+不要写成冷冰冰的流程单，也不要写成长篇流水账。
+不要直接输出自由文本回复，必须调用 ` + "`summary`" + ` 工具；` + "`summary`" + ` 参数应是简洁但信息完整的中文字符串。
 </system_reminder>`
 }
 
 func StoryContextSummaryReminder() string {
-	return `<system_reminder kind="story_summary_task">
+	return `<system_reminder>
 你现在不是在创建新回复，而是在为当前 story runtime 整理“稍后继续工作用”的累计上下文摘要。
-请基于你刚刚继承到的完整上下文提炼真正会影响后续叙事归并和批处理完成的信息。
-摘要使用 Markdown 二级标题，按固定顺序组织为：## 当前处理范围、## 已确认叙事、## 新增线索与判断、## 待完成事项。
+请基于你刚刚继承到的完整上下文（包括当前 system prompt 与已有消息）提炼真正会影响后续叙事归并和批处理完成的信息。
+摘要使用 Markdown 二级标题，按固定顺序组织为：` + "`## 当前处理范围`、`## 已确认叙事`、`## 新增线索与判断`、`## 待完成事项`" + `。
+` + "`## 当前处理范围`" + ` 写当前批次或当前压缩范围正在处理什么主题、消息簇或叙事簇。
+` + "`## 已确认叙事`" + ` 写已识别出的 story、归属关系、稳定判断；如果没有可留空但标题保留。
+` + "`## 新增线索与判断`" + ` 写本轮新增消息带来的 merge / split / rewrite / create 判断，以及关键工具结果。
+` + "`## 待完成事项`" + ` 写尚未完成的 create/rewrite/finish，以及仍有歧义的归并点。
 忽略寒暄、重复内容、无关细节和冗余措辞。
-不要直接输出自由文本回复，必须调用 summary 工具；summary 参数应是简洁但信息完整的中文字符串。
+不要直接输出自由文本回复，必须调用 ` + "`summary`" + ` 工具；` + "`summary`" + ` 参数应是简洁但信息完整的中文字符串。
 </system_reminder>`
 }
