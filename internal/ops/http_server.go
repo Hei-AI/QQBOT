@@ -13,6 +13,7 @@ import (
 	"embed"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -57,6 +58,7 @@ func (s *HTTPServer) routes() {
 	s.mux.HandleFunc("/agent-task/query", s.agentTaskQuery)
 	s.mux.HandleFunc("/app-log/query", s.appLogQuery)
 	s.mux.HandleFunc("/llm-chat-call/query", s.llmCallQuery)
+	s.mux.HandleFunc("/llm-token-usage/summary", s.llmTokenUsageSummary)
 	s.mux.HandleFunc("/napcat-event/query", s.napcatEventQuery)
 	s.mux.HandleFunc("/napcat-group-message/query", s.napcatMessageQuery)
 	s.mux.HandleFunc("/story/query", s.storyQuery)
@@ -111,7 +113,14 @@ func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	common.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "timestamp": common.ISO(time.Now())})
+	cwd, _ := os.Getwd()
+	executable, _ := os.Executable()
+	common.WriteJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"timestamp":  common.ISO(time.Now()),
+		"cwd":        cwd,
+		"executable": executable,
+	})
 }
 
 func (s *HTTPServer) llmProviders(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +322,24 @@ func (s *HTTPServer) llmCallQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	pageItems, pagination := db.Paginate(filtered, page, pageSize)
 	common.WriteJSON(w, http.StatusOK, map[string]any{"pagination": pagination, "items": pageItems})
+}
+
+func (s *HTTPServer) llmTokenUsageSummary(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	var startAt, endAt *time.Time
+	if date := common.QueryString(r, "date"); date != "" {
+		day, err := time.ParseInLocation("2006-01-02", date, time.Local)
+		if err != nil {
+			common.WriteJSON(w, http.StatusBadRequest, map[string]any{"message": "date 必须是 YYYY-MM-DD"})
+			return
+		}
+		next := day.AddDate(0, 0, 1)
+		startAt = &day
+		endAt = &next
+	}
+	common.WriteJSON(w, http.StatusOK, s.store.LLMTokenUsageSummary(startAt, endAt))
 }
 
 func (s *HTTPServer) napcatEventQuery(w http.ResponseWriter, r *http.Request) {

@@ -51,28 +51,24 @@ type MagnetSearchConfig struct {
 
 // AgentConfig 控制 root/story 循环节奏和能力限制。
 type AgentConfig struct {
-	ContextCompactionTotalTokenThreshold int              `yaml:"contextCompactionTotalTokenThreshold"`
-	LLMRetryBackoffMs                    int              `yaml:"llmRetryBackoffMs"`
-	WaitToolMaxWaitMs                    int              `yaml:"waitToolMaxWaitMs"`
-	CacheKeepaliveEnabled                bool             `yaml:"cacheKeepaliveEnabled"`
-	NotificationBatchWindowMs            int              `yaml:"notificationBatchWindowMs"`
-	AITone                               AIToneConfig     `yaml:"aiTone"`
-	Autonomous                           AutonomousConfig `yaml:"autonomous"`
-	Story                                StoryConfig      `yaml:"story"`
-	Terminal                             TerminalConfig   `yaml:"terminal"`
+	ContextCompactionTotalTokenThreshold int                 `yaml:"contextCompactionTotalTokenThreshold"`
+	LLMRetryBackoffMs                    int                 `yaml:"llmRetryBackoffMs"`
+	WaitToolMaxWaitMs                    int                 `yaml:"waitToolMaxWaitMs"`
+	AIToneThreshold                      float64             `yaml:"aiToneThreshold"`
+	CacheKeepaliveEnabled                bool                `yaml:"cacheKeepaliveEnabled"`
+	EventCoalesce                        EventCoalesceConfig `yaml:"eventCoalesce"`
+	Autonomous                           AutonomousConfig    `yaml:"autonomous"`
+	Story                                StoryConfig         `yaml:"story"`
+	Terminal                             TerminalConfig      `yaml:"terminal"`
 }
 
-// AIToneConfig 控制 send_message 的 AIRadar 腔调拦截。
-type AIToneConfig struct {
-	Enabled   *bool   `yaml:"enabled"`
-	Threshold float64 `yaml:"threshold"`
-}
-
-func (c AIToneConfig) EnabledValue() bool {
-	if c.Enabled == nil {
-		return true
-	}
-	return *c.Enabled
+// EventCoalesceConfig 控制 QQ 消息进入 Root LLM 前的轻量聚合窗口。
+type EventCoalesceConfig struct {
+	Enabled         bool `yaml:"enabled"`
+	GroupWindowMs   int  `yaml:"groupWindowMs"`
+	PrivateWindowMs int  `yaml:"privateWindowMs"`
+	MaxWindowMs     int  `yaml:"maxWindowMs"`
+	MaxEvents       int  `yaml:"maxEvents"`
 }
 
 // AutonomousConfig 控制没有外部事件时的受控自我延续。
@@ -226,6 +222,11 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) {
+	coalesceUnset := !cfg.Server.Agent.EventCoalesce.Enabled &&
+		cfg.Server.Agent.EventCoalesce.GroupWindowMs == 0 &&
+		cfg.Server.Agent.EventCoalesce.PrivateWindowMs == 0 &&
+		cfg.Server.Agent.EventCoalesce.MaxWindowMs == 0 &&
+		cfg.Server.Agent.EventCoalesce.MaxEvents == 0
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 20003
 	}
@@ -235,8 +236,23 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.Agent.WaitToolMaxWaitMs == 0 {
 		cfg.Server.Agent.WaitToolMaxWaitMs = int((10 * time.Minute).Milliseconds())
 	}
-	if cfg.Server.Agent.AITone.Threshold == 0 {
-		cfg.Server.Agent.AITone.Threshold = 0.65
+	if cfg.Server.Agent.AIToneThreshold <= 0 {
+		cfg.Server.Agent.AIToneThreshold = 0.7
+	}
+	if coalesceUnset {
+		cfg.Server.Agent.EventCoalesce.Enabled = true
+	}
+	if cfg.Server.Agent.EventCoalesce.GroupWindowMs == 0 {
+		cfg.Server.Agent.EventCoalesce.GroupWindowMs = 1200
+	}
+	if cfg.Server.Agent.EventCoalesce.PrivateWindowMs == 0 {
+		cfg.Server.Agent.EventCoalesce.PrivateWindowMs = 400
+	}
+	if cfg.Server.Agent.EventCoalesce.MaxWindowMs == 0 {
+		cfg.Server.Agent.EventCoalesce.MaxWindowMs = 2500
+	}
+	if cfg.Server.Agent.EventCoalesce.MaxEvents == 0 {
+		cfg.Server.Agent.EventCoalesce.MaxEvents = 8
 	}
 	if cfg.Server.Agent.Autonomous.IdleDelayMs == 0 {
 		cfg.Server.Agent.Autonomous.IdleDelayMs = int((30 * time.Second).Milliseconds())

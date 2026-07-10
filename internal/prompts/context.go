@@ -44,6 +44,17 @@ func QQMessageRoutedAt(targetType, targetID, nickname, userID, messageBody strin
 </qq_message>`, targetType, targetID, timeAttribute, nickname, userID, messageBody)
 }
 
+func QQSelfMessageRoutedAt(targetType, targetID, nickname, userID, messageBody string, eventTime time.Time) string {
+	timeAttribute := ""
+	if !eventTime.IsZero() {
+		timeAttribute = fmt.Sprintf(` time="%s"`, eventTime.Format(time.RFC3339))
+	}
+	return fmt.Sprintf(`<qq_message self="true" target_type="%s" target_id="%s"%s>
+%s (%s):
+%s
+</qq_message>`, targetType, targetID, timeAttribute, nickname, userID, messageBody)
+}
+
 func QQMessageWithContext(nickname, userID, messageBody, messageType, groupID string) string {
 	targetID := groupID
 	if messageType == "private" {

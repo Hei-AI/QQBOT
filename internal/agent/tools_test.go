@@ -101,20 +101,20 @@ func TestSendMessageAcceptsControlledBrowserScreenshot(t *testing.T) {
 
 func TestSendMessageAcceptsGroupTypeAlias(t *testing.T) {
 	sender := &recordingMessageSender{}
-	tool := sendMessageTool{sender: sender, aiToneDisabled: true}
+	tool := sendMessageTool{sender: sender}
 	result, err := tool.Execute(context.Background(), agentruntime.ToolCall{
 		Name: "send_message",
 		Arguments: map[string]any{
 			"groupType": "private",
-			"targetId":  "2001",
-			"message":   "hello",
+			"targetId":  "1129974489",
+			"message":   "对 你就是冰箱 压缩机响了就是在说话",
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sender.target != "private:2001" || sender.message != "hello" || strings.Contains(result.Content, "MESSAGE_TARGET_REQUIRED") {
-		t.Fatalf("groupType alias should be accepted: target=%s message=%q result=%s", sender.target, sender.message, result.Content)
+	if sender.target != "private:1129974489" || sender.message == "" || strings.Contains(result.Content, "MESSAGE_TARGET_REQUIRED") {
+		t.Fatalf("groupType alias should route private message: target=%s message=%q result=%s", sender.target, sender.message, result.Content)
 	}
 }
 
@@ -185,29 +185,6 @@ func TestSendMessageAllowsLowAIToneText(t *testing.T) {
 	}
 	if sender.target != "private:2001" || sender.message == "" || strings.Contains(result.Content, "AI_TONE_TOO_HIGH") {
 		t.Fatalf("low AI-tone message should be sent: target=%s message=%q result=%s", sender.target, sender.message, result.Content)
-	}
-}
-
-func TestSendMessageAllowsHighAIToneTextWhenDisabled(t *testing.T) {
-	classifier, err := airadar.NewDefaultClassifier()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sender := &recordingMessageSender{}
-	tool := sendMessageTool{sender: sender, aiToneClassifier: classifier, aiToneThreshold: 0.65, aiToneDisabled: true}
-	result, err := tool.Execute(context.Background(), agentruntime.ToolCall{
-		Name: "send_message",
-		Arguments: map[string]any{
-			"targetType": "private",
-			"targetId":   "2001",
-			"message":    "刚看到一个 有人用二战侦察相机拍了四十年冰川 十万张照片 相机63磅 从一万英尺高空拍的 照片边缘有物理仪器记录的时间和高度 比数码相机早几十年",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sender.target != "private:2001" || sender.message == "" || strings.Contains(result.Content, "AI_TONE_TOO_HIGH") {
-		t.Fatalf("disabled AI-tone check should allow message: target=%s message=%q result=%s", sender.target, sender.message, result.Content)
 	}
 }
 

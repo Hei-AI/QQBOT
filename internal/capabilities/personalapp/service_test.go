@@ -241,6 +241,9 @@ func TestNovelOpenProjectFallsBackToActiveWhenModelUsesStaleID(t *testing.T) {
 	if !strings.Contains(result.Content, `"ok":true`) {
 		t.Fatalf("append through stale id failed: %s", result.Content)
 	}
+	if !strings.Contains(result.Content, `"filePath"`) || !strings.Contains(result.Content, `"bytesWritten"`) {
+		t.Fatalf("append result should include write details: %s", result.Content)
+	}
 	data, err := os.ReadFile(filepath.Join(service.Root(), "projects", project.ID, "draft.md"))
 	if err != nil {
 		t.Fatal(err)

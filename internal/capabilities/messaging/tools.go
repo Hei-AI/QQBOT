@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"QqBot/internal/agentruntime"
 )
@@ -29,8 +30,7 @@ func (t SendMessageTool) Execute(_ context.Context, call agentruntime.ToolCall) 
 	if t.Sender == nil {
 		return agentruntime.ToolResult{}, fmt.Errorf("消息发送器不可用")
 	}
-	targetType, _ := call.Arguments["targetType"].(string)
-	targetID, _ := call.Arguments["targetId"].(string)
+	targetType, targetID := sendMessageTarget(call.Arguments)
 	message, _ := call.Arguments["message"].(string)
 	var id int
 	var err error
@@ -41,4 +41,34 @@ func (t SendMessageTool) Execute(_ context.Context, call agentruntime.ToolCall) 
 	}
 	data, _ := json.Marshal(map[string]any{"messageId": id})
 	return agentruntime.ToolResult{Kind: "business", Content: string(data)}, err
+}
+
+func sendMessageTarget(args map[string]any) (string, string) {
+	targetType := strings.TrimSpace(sendMessageStringArg(args, "targetType", "target_type", "messageType", "groupType"))
+	targetID := strings.TrimSpace(sendMessageStringArg(args, "targetId", "target_id"))
+	if targetType == "" {
+		if groupID := strings.TrimSpace(sendMessageStringArg(args, "groupId", "group_id")); groupID != "" {
+			targetType = "group"
+			targetID = groupID
+		} else if userID := strings.TrimSpace(sendMessageStringArg(args, "userId", "user_id", "privateUserId", "private_user_id")); userID != "" {
+			targetType = "private"
+			targetID = userID
+		}
+	}
+	switch targetType {
+	case "qq_group":
+		targetType = "group"
+	case "qq_private":
+		targetType = "private"
+	}
+	return targetType, targetID
+}
+
+func sendMessageStringArg(args map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := args[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

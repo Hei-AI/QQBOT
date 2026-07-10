@@ -22,6 +22,23 @@ func TestQQMessageRoutedAtIncludesReplyRouteAndTime(t *testing.T) {
 	}
 }
 
+func TestQQSelfMessageRoutedAtMarksSelf(t *testing.T) {
+	eventTime := time.Date(2026, 7, 3, 9, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	rendered := QQSelfMessageRoutedAt("private", "461105039", "帕秋莉", "180920020", "刚刚那句是我说的", eventTime)
+	for _, expected := range []string{
+		`<qq_message self="true"`,
+		`target_type="private"`,
+		`target_id="461105039"`,
+		`time="2026-07-03T09:00:00+08:00"`,
+		"帕秋莉 (180920020):",
+		"刚刚那句是我说的",
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("self QQ message missing %q:\n%s", expected, rendered)
+		}
+	}
+}
+
 func TestRootContextSummaryReminderPreservesCurrentTaskSnapshot(t *testing.T) {
 	rendered := RootContextSummaryReminder()
 	for _, expected := range []string{

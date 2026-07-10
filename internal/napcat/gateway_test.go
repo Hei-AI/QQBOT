@@ -4,6 +4,8 @@ import (
 	rootagent "QqBot/internal/agent"
 	"QqBot/internal/config"
 	"QqBot/internal/db"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,6 +73,37 @@ func TestRenderCompactSegments(t *testing.T) {
 	}, 0)
 	if got != "[引用消息]收到[语音]" {
 		t.Fatalf("unexpected compact rendering: %q", got)
+	}
+}
+
+func TestNormalizeFileSegmentDownloadsTextPreview(t *testing.T) {
+	t.Chdir(t.TempDir())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("第一行\n第二行"))
+	}))
+	defer server.Close()
+	store, err := db.OpenStore(filepath.Join(t.TempDir(), "store.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	gateway := NewNapcatGateway(&config.Config{}, store, rootagent.NewEventQueue(), nil)
+
+	segments, raw := gateway.normalizeMessageSegments(map[string]any{
+		"message": []any{map[string]any{
+			"type": "file",
+			"data": map[string]any{"file": "note.txt", "url": server.URL},
+		}},
+	}, "1001")
+
+	if len(segments) != 1 || segments[0].Type != "file" {
+		t.Fatalf("unexpected segments: %#v", segments)
+	}
+	if !strings.Contains(raw, "[文件: note.txt]") || !strings.Contains(raw, "第一行") {
+		t.Fatalf("file preview not rendered: %q", raw)
+	}
+	if segments[0].Data["localFile"] == "" || segments[0].Data["preview"] == "" {
+		t.Fatalf("file data missing local path/preview: %#v", segments[0].Data)
 	}
 }
 
@@ -144,5 +177,65 @@ func TestHandleEventPublishesOtherGroupMessage(t *testing.T) {
 
 	if got := events.Count(); got != 1 {
 		t.Fatalf("expected non-self message to publish Agent event, got %d", got)
+	}
+}
+
+func TestHandleEventPublishesGroupBanNotice(t *testing.T) {
+	store, err := db.OpenStore(filepath.Join(t.TempDir(), "store.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := rootagent.NewEventQueue()
+	cfg := &config.Config{}
+	cfg.Server.Napcat.ListenGroupIDs = []string{"1001"}
+	cfg.Server.Bot.QQ = "42"
+	gateway := NewNapcatGateway(cfg, store, events, nil)
+
+	gateway.handleEvent(map[string]any{
+		"post_type":   "notice",
+		"notice_type": "group_ban",
+		"sub_type":    "ban",
+		"group_id":    "1001",
+		"user_id":     "42",
+		"operator_id": "24",
+		"duration":    float64(600),
+		"time":        float64(1780714940),
+	})
+
+	drained := events.DequeueAll()
+	if len(drained) != 1 {
+		t.Fatalf("expected one group ban notice event, got %d", len(drained))
+	}
+	event := drained[0]
+	if event.Type != "napcat_group_ban_notice" {
+		t.Fatalf("unexpected event type: %s", event.Type)
+	}
+	if event.Data["isSelf"] != true || event.Data["duration"] != 600 || event.Data["operatorId"] != "24" {
+		t.Fatalf("unexpected event data: %#v", event.Data)
+	}
+}
+
+func TestHandleEventIgnoresUnlistenedGroupBanNotice(t *testing.T) {
+	store, err := db.OpenStore(filepath.Join(t.TempDir(), "store.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := rootagent.NewEventQueue()
+	cfg := &config.Config{}
+	cfg.Server.Napcat.ListenGroupIDs = []string{"1001"}
+	gateway := NewNapcatGateway(cfg, store, events, nil)
+
+	gateway.handleEvent(map[string]any{
+		"post_type":   "notice",
+		"notice_type": "group_ban",
+		"sub_type":    "lift_ban",
+		"group_id":    "2002",
+		"user_id":     "42",
+	})
+
+	if got := events.Count(); got != 0 {
+		t.Fatalf("expected unlistened group notice not to publish Agent event, got %d", got)
 	}
 }

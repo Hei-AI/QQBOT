@@ -513,7 +513,7 @@ func (s *Session) availableToolsLocked(stateID string) []string {
 	case "news":
 		return []string{"personal_screen", "workspace_app", "activity_app", "news_app", "open_ithome_article", "project_app"}
 	}
-	return []string{"wait", "send_message", "analyze_image", "detect_ai_tone", "browser", "search_web", "search_memory", "searchMagnetFromWeb", "open_ithome_article", "personal_screen", "workspace_app", "activity_app", "todo_app", "novel_app", "project_app", "music_app", "news_app"}
+	return []string{"wait", "send_message", "analyze_image", "detect_ai_tone", "browser", "search_web", "search_memory", "search_chat_history", "searchMagnetFromWeb", "open_ithome_article", "personal_screen", "workspace_app", "activity_app", "todo_app", "novel_app", "project_app", "music_app", "news_app"}
 }
 
 func (s *Session) availableToolsLockedForSnapshot() []string {

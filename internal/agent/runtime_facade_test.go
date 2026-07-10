@@ -96,6 +96,21 @@ func TestUnavailableToolExecutionIsNotPersistedInModelContext(t *testing.T) {
 	}
 }
 
+func TestSkippedSideEffectErrorsStopContinuationAndPersistence(t *testing.T) {
+	for _, errorCode := range []string{"STALE_ROUND_TOOL_SKIPPED", "DUPLICATE_SEND_MESSAGE_SKIPPED"} {
+		execution := agentruntime.ToolExecution{
+			Call:   agentruntime.ToolCall{ID: "call-1", Name: "send_message"},
+			Result: agentruntime.ToolResult{Kind: "business", Content: `{"ok":false,"error":"` + errorCode + `"}`},
+		}
+		if shouldContinueAfterTool([]agentruntime.ToolExecution{execution}) {
+			t.Fatalf("%s should stop the current root round", errorCode)
+		}
+		if shouldPersistToolResult(execution) {
+			t.Fatalf("%s should not enter model context", errorCode)
+		}
+	}
+}
+
 func TestSuccessfulActEnterExecutionIsPersistedInModelContext(t *testing.T) {
 	execution := agentruntime.ToolExecution{
 		Call:   agentruntime.ToolCall{ID: "call-1", Name: "act", Arguments: map[string]any{"action": "enter", "query": "novel"}},
@@ -143,6 +158,80 @@ func TestExternalEventSuppressesSameBatchSelfContinuation(t *testing.T) {
 	}
 	if hasExternalAgentEvent([]AgentEvent{{Type: "wake", Data: map[string]any{"reason": "self_continuation"}}}) {
 		t.Fatal("wake-only batch should remain autonomous")
+	}
+}
+
+func TestPreemptiveCountIgnoresStoryRecall(t *testing.T) {
+	queue := NewEventQueue()
+	queue.Enqueue(AgentEvent{Type: "story_recall_completed"})
+	if got := queue.PreemptiveCount(); got != 0 {
+		t.Fatalf("story recall should not stale-block side effects, got %d", got)
+	}
+	queue.Enqueue(AgentEvent{Type: "napcat_private_message"})
+	if got := queue.PreemptiveCount(); got != 1 {
+		t.Fatalf("QQ messages should stale-block side effects, got %d", got)
+	}
+}
+
+func TestStoryRecallDoesNotTriggerRootRoundByItself(t *testing.T) {
+	if eventTriggersRootRound("story_recall_completed") {
+		t.Fatal("story recall should enrich context without starting another root round")
+	}
+	if !eventTriggersRootRound("napcat_private_message") {
+		t.Fatal("QQ messages should trigger root rounds")
+	}
+}
+
+func TestEventCoalesceWindowOnlyAppliesToQQMessages(t *testing.T) {
+	cfg := config.EventCoalesceConfig{GroupWindowMs: 1200, PrivateWindowMs: 400}
+	if got := eventCoalesceWindow(cfg, []AgentEvent{{Type: "news_article_ingested"}}); got != 0 {
+		t.Fatalf("news should not be delayed by QQ coalesce window, got %s", got)
+	}
+	if got := eventCoalesceWindow(cfg, []AgentEvent{{Type: "napcat_group_message"}}); got != 1200*time.Millisecond {
+		t.Fatalf("group window mismatch: %s", got)
+	}
+	if got := eventCoalesceWindow(cfg, []AgentEvent{{Type: "napcat_group_message"}, {Type: "napcat_private_message"}}); got != 400*time.Millisecond {
+		t.Fatalf("private messages should use shorter window when mixed, got %s", got)
+	}
+}
+
+func TestRenderGroupBanNoticeMarksSelfMute(t *testing.T) {
+	rendered := renderGroupBanNotice(AgentEvent{
+		Type: "napcat_group_ban_notice",
+		Data: map[string]any{
+			"groupId":    "1001",
+			"userId":     "42",
+			"operatorId": "24",
+			"subType":    "ban",
+			"duration":   600,
+			"isSelf":     true,
+		},
+		At: time.Date(2026, 7, 10, 12, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60)),
+	})
+	for _, expected := range []string{`<qq_group_notice type="group_ban"`, "你被禁言了", "10 分钟", "操作者 QQ：24", "群号：1001"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("rendered notice missing %q:\n%s", expected, rendered)
+		}
+	}
+}
+
+func TestWaitForEventCoalesceCollectsBurst(t *testing.T) {
+	events := NewEventQueue()
+	runtime := &AgentRuntime{
+		cfg: &config.Config{Server: config.ServerConfig{Agent: config.AgentConfig{
+			EventCoalesce: config.EventCoalesceConfig{Enabled: true, GroupWindowMs: 5, PrivateWindowMs: 2, MaxWindowMs: 40, MaxEvents: 8},
+		}}},
+		events: events,
+	}
+	events.Enqueue(AgentEvent{Type: "napcat_group_message", Data: map[string]any{"rawMessage": "1"}})
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		events.Enqueue(AgentEvent{Type: "napcat_group_message", Data: map[string]any{"rawMessage": "2"}})
+	}()
+	runtime.waitForEventCoalesce()
+	drained := events.DequeueAll()
+	if len(drained) != 2 {
+		t.Fatalf("expected burst messages to coalesce, got %d: %#v", len(drained), drained)
 	}
 }
 
@@ -289,6 +378,87 @@ func TestToolSideEffectClassification(t *testing.T) {
 	}
 }
 
+func TestRecentSendDedupKeyUsesTargetAndMessage(t *testing.T) {
+	call := agentruntime.ToolCall{Name: "send_message", Arguments: map[string]any{
+		"targetType": "private",
+		"targetId":   "461105039",
+		"message":    "六周年 红包还是转账 挺甜啊",
+	}}
+	runtime := &AgentRuntime{}
+	key := sendMessageDedupKey(call)
+	if key == "" {
+		t.Fatal("send_message dedup key should not be empty")
+	}
+	if runtime.recentSendExists(key, 2*time.Minute) {
+		t.Fatal("empty recent send cache should not report duplicate")
+	}
+	runtime.recordRecentSend(call)
+	if !runtime.recentSendExists(key, 2*time.Minute) {
+		t.Fatal("same target and message should be treated as duplicate")
+	}
+	otherTarget := agentruntime.ToolCall{Name: "send_message", Arguments: map[string]any{
+		"targetType": "group",
+		"targetId":   "253631878",
+		"message":    "六周年 红包还是转账 挺甜啊",
+	}}
+	if runtime.recentSendExists(sendMessageDedupKey(otherTarget), 2*time.Minute) {
+		t.Fatal("same message to a different target should not be deduplicated")
+	}
+}
+
+func TestRecentSendDedupNormalizesTonePrefix(t *testing.T) {
+	first := agentruntime.ToolCall{Name: "send_message", Arguments: map[string]any{
+		"targetType": "private",
+		"targetId":   "461105039",
+		"message":    "没有啊 小腻发了个百叶窗页面 我去截图看看里面是啥",
+	}}
+	second := agentruntime.ToolCall{Name: "send_message", Arguments: map[string]any{
+		"targetType": "private",
+		"targetId":   "461105039",
+		"message":    "小腻发了个百叶窗页面 我去截图看看里面是啥",
+	}}
+	if sendMessageDedupKey(first) != sendMessageDedupKey(second) {
+		t.Fatalf("tone prefix should not bypass send dedup:\n%q\n%q", sendMessageDedupKey(first), sendMessageDedupKey(second))
+	}
+}
+
+func TestStaleSideEffectSkipDoesNotApplyToSendMessage(t *testing.T) {
+	if shouldSkipStaleSideEffect("send_message", true, 1) {
+		t.Fatal("send_message already chosen by the model should be sent even if a new event is queued")
+	}
+	if !shouldSkipStaleSideEffect("browser", true, 1) {
+		t.Fatal("external side effects should still be skipped on stale rounds")
+	}
+	if !shouldSkipStaleSideEffect("bash", true, 1) {
+		t.Fatal("terminal side effects should still be skipped on stale rounds")
+	}
+	if shouldSkipStaleSideEffect("novel_app", true, 1) {
+		t.Fatal("personal app writes should be persisted even if a new event is queued")
+	}
+	if shouldSkipStaleSideEffect("search_web", false, 1) {
+		t.Fatal("read-only tools should not be skipped as side effects")
+	}
+}
+
+func TestToolExecutionKeyIncludesArguments(t *testing.T) {
+	first := toolExecutionKey(agentruntime.ToolCall{
+		ID:        "call-reused",
+		Name:      "novel_app",
+		Arguments: map[string]any{"action": "append_draft", "projectId": "novel-1", "text": "first"},
+	})
+	second := toolExecutionKey(agentruntime.ToolCall{
+		ID:        "call-reused",
+		Name:      "novel_app",
+		Arguments: map[string]any{"action": "append_draft", "projectId": "novel-1", "text": "second"},
+	})
+	if first == second {
+		t.Fatalf("tool execution key must not reuse prior result when arguments change: %s", first)
+	}
+	if !strings.HasPrefix(first, "call-reused:") || !strings.HasPrefix(second, "call-reused:") {
+		t.Fatalf("execution key should retain provider call id for traceability: %q %q", first, second)
+	}
+}
+
 func TestShouldStopAfterSuccessfulSendMessage(t *testing.T) {
 	executions := []agentruntime.ToolExecution{{
 		Call: agentruntime.ToolCall{
@@ -328,23 +498,52 @@ func TestShouldContinueAfterFailedSendMessage(t *testing.T) {
 	}
 }
 
-func TestShouldStopAfterAIToneBlockedSendMessage(t *testing.T) {
+func TestSuccessfulSendMessageToolPairStaysOutOfModelContext(t *testing.T) {
 	executions := []agentruntime.ToolExecution{{
-		Call:   agentruntime.ToolCall{Name: "send_message"},
-		Result: agentruntime.ToolResult{Kind: "business", Content: `{"ok":false,"error":"AI_TONE_TOO_HIGH","prob":0.8}`},
+		Call:   agentruntime.ToolCall{ID: "call-send", Name: "send_message"},
+		Result: agentruntime.ToolResult{Kind: "business", Content: `{"messageId":1}`},
 	}}
-	if shouldContinueAfterTool(executions) {
-		t.Fatal("AI tone blocked send_message must stop instead of asking the model to report/retry")
-	}
 	if shouldPersistToolResult(executions[0]) {
-		t.Fatal("AI tone blocked result should stay out of chat context")
+		t.Fatal("successful send_message tool result should stay out of model context; self qq_message records what was sent")
 	}
 	assistant := assistantForPersistence(agentruntime.Message{
 		Role:      "assistant",
 		ToolCalls: []agentruntime.ToolCall{{ID: executions[0].Call.ID, Name: "send_message"}},
 	}, executions)
 	if len(assistant.ToolCalls) != 0 {
-		t.Fatalf("AI tone blocked assistant tool call should stay out of chat context: %#v", assistant)
+		t.Fatalf("successful send_message tool call should be dropped from model context: %#v", assistant)
+	}
+	if shouldPersistAssistant(agentruntime.Message{
+		Role:      "assistant",
+		ToolCalls: []agentruntime.ToolCall{{ID: executions[0].Call.ID, Name: "send_message"}},
+	}, executions) {
+		t.Fatal("assistant send_message tool call should not be persisted when the send succeeded")
+	}
+}
+
+func TestShouldContinueAfterAIToneBlockedSendMessage(t *testing.T) {
+	executions := []agentruntime.ToolExecution{{
+		Call:   agentruntime.ToolCall{Name: "send_message"},
+		Result: agentruntime.ToolResult{Kind: "business", Content: `{"ok":false,"error":"AI_TONE_TOO_HIGH","prob":0.8}`},
+	}}
+	if !shouldContinueAfterTool(executions) {
+		t.Fatal("AI tone blocked send_message should continue so the model can rewrite or wait")
+	}
+	if shouldPersistToolResult(executions[0]) {
+		t.Fatal("AI tone blocked result should stay out of model context")
+	}
+	assistant := assistantForPersistence(agentruntime.Message{
+		Role:      "assistant",
+		ToolCalls: []agentruntime.ToolCall{{ID: executions[0].Call.ID, Name: "send_message"}},
+	}, executions)
+	if len(assistant.ToolCalls) != 0 {
+		t.Fatalf("AI tone blocked assistant tool call should be dropped from model context: %#v", assistant)
+	}
+	reminder := aiToneBlockedReminderMessage()
+	for _, forbidden := range []string{"prob", "0.8", "messageId", "AI_TONE_TOO_HIGH"} {
+		if strings.Contains(reminder.Content, forbidden) {
+			t.Fatalf("AI tone reminder should not include volatile failure details %q: %s", forbidden, reminder.Content)
+		}
 	}
 }
 
@@ -380,6 +579,25 @@ func TestPlainWaitAssistantIsNotPersisted(t *testing.T) {
 	}
 }
 
+func TestRecentAssistantActionRequiredReminderDetected(t *testing.T) {
+	messages := []agentruntime.Message{
+		{Role: "user", Content: "old"},
+		{Role: "user", Content: `<system_reminder label="assistant_action_required">必须调用工具</system_reminder>`},
+	}
+	if !hasRecentAssistantActionRequiredReminder(messages) {
+		t.Fatal("recent assistant action reminder should suppress another repair round")
+	}
+	messages = append(messages,
+		agentruntime.Message{Role: "user", Content: "1"},
+		agentruntime.Message{Role: "user", Content: "2"},
+		agentruntime.Message{Role: "user", Content: "3"},
+		agentruntime.Message{Role: "user", Content: "4"},
+	)
+	if hasRecentAssistantActionRequiredReminder(messages) {
+		t.Fatal("old assistant action reminder should not suppress future repairs forever")
+	}
+}
+
 func TestShouldContinueAfterToolFailure(t *testing.T) {
 	executions := []agentruntime.ToolExecution{{
 		Call:   agentruntime.ToolCall{Name: "search_web"},
@@ -397,6 +615,38 @@ func TestShouldStopAfterUnknownToolFailure(t *testing.T) {
 	}}
 	if shouldContinueAfterTool(executions) {
 		t.Fatal("permanent unknown-tool failures must not create an autonomous retry loop")
+	}
+}
+
+func TestBrowserResultReminderIncludesSummaryAndImagePath(t *testing.T) {
+	message, ok := browserResultReminderMessage(
+		`{"ok":true,"summary":"四扇百叶窗全部打开。","title":"No Ideas Here","url":"https://example.com","imagePath":"D:\\goGroup\\workspace\\qq-bot\\data\\browser-screenshots\\browser.png"}`,
+		map[string]any{"task": "打开这个页面看看", "url": "https://example.com"},
+		`<qq_message target_type="group" target_id="1001">alice (1): 看这个 https://example.com</qq_message>`,
+	)
+	if !ok {
+		t.Fatal("browser result should produce a follow-up reminder")
+	}
+	for _, expected := range []string{"browser_result_ready", "source_qq_message", "requested_action", "四扇百叶窗全部打开", "imagePath:", "send_message"} {
+		if !strings.Contains(message.Content, expected) {
+			t.Fatalf("browser reminder missing %q:\n%s", expected, message.Content)
+		}
+	}
+}
+
+func TestWebSearchResultReminderIncludesOrigin(t *testing.T) {
+	message, ok := webSearchResultReminderMessage(
+		"这是搜索摘要。",
+		map[string]any{"query": "https://example.com"},
+		`<qq_message target_type="private" target_id="2">bob (2): 看这个</qq_message>`,
+	)
+	if !ok {
+		t.Fatal("web search result should produce a follow-up reminder")
+	}
+	for _, expected := range []string{"web_search_result_ready", "source_qq_message", "requested_action", "这是搜索摘要"} {
+		if !strings.Contains(message.Content, expected) {
+			t.Fatalf("web search reminder missing %q:\n%s", expected, message.Content)
+		}
 	}
 }
 
@@ -419,5 +669,33 @@ new topic
 	}
 	if query := latestStoryRecallQuery(messages); query != "bob (2): new topic" {
 		t.Fatalf("unexpected recall query: %q", query)
+	}
+}
+
+func TestLatestStoryRecallQueryIgnoresSelfQQMessage(t *testing.T) {
+	messages := []agentruntime.Message{
+		{Role: "user", Content: `<qq_message target_type="group" target_id="1001">
+alice (1):
+new topic
+</qq_message>`},
+		{Role: "user", Content: `<qq_message self="true" target_type="group" target_id="1001">
+帕秋莉 (180920020):
+my reply
+</qq_message>`},
+	}
+	if query := latestStoryRecallQuery(messages); query != "alice (1): new topic" {
+		t.Fatalf("self qq_message should not drive story recall query, got %q", query)
+	}
+}
+
+func TestTurnFocusReminderPinsLatestQQMessage(t *testing.T) {
+	message := turnFocusReminder(`<qq_message target_type="group" target_id="1001">
+alice (1):
+新消息
+</qq_message>`)
+	for _, expected := range []string{"turn_focus", "本轮最新 QQ 消息", "先识别是谁说的", "只允许 send_message 或 wait", "不要调用个人工作台", "不要回头补更早", "新消息"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("turn focus reminder missing %q:\n%s", expected, message)
+		}
 	}
 }

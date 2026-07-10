@@ -122,7 +122,7 @@ type ActTool struct {
 func (ActTool) Definition() agentruntime.ToolDefinition {
 	return agentruntime.ToolDefinition{
 		Name:        "act",
-		Description: "统一行动入口。选择 action 后分发到 wait、send_message、analyze_image、detect_ai_tone、browser、search_web、searchMagnetFromWeb、open_ithome_article 或个人 App。",
+		Description: "统一行动入口。选择 action 后分发到 wait、send_message、analyze_image、detect_ai_tone、browser、search_web、search_memory、search_chat_history、searchMagnetFromWeb、open_ithome_article 或个人 App。",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -140,9 +140,11 @@ func (ActTool) Definition() agentruntime.ToolDefinition {
 						"browser",
 						"search_web",
 						"search_memory",
+						"search_chat_history",
 						"searchMagnetFromWeb",
 						"open_ithome_article",
 						"personal_screen",
+						"workspace_app",
 						"todo_app",
 						"novel_app",
 						"project_app",
@@ -160,8 +162,11 @@ func (ActTool) Definition() agentruntime.ToolDefinition {
 				"imagePath":   map[string]any{"type": "string", "description": "action=send_message 时可发送的受控本地图片路径，或图片分析工具需要的路径。"},
 				"messageId":   map[string]any{"type": "integer", "description": "action=analyze_image 时可指定 QQ 消息 ID。"},
 				"text":        map[string]any{"type": "string", "description": "action=detect_ai_tone 时要检测的草稿；App action 时也可作为正文、笔记或任务文本。"},
-				"threshold":   map[string]any{"type": "number", "description": "action=detect_ai_tone 时的 AI 腔调阈值，默认 0.65。"},
+				"threshold":   map[string]any{"type": "number", "description": "action=detect_ai_tone 时的 AI 腔调阈值，默认 0.7。"},
 				"query":       map[string]any{"type": "string", "description": "搜索、浏览器、记忆检索或 enter app id。"},
+				"userId":      map[string]any{"type": "string", "description": "action=search_chat_history 时可按发送者 QQ 过滤。"},
+				"days":        map[string]any{"type": "integer", "description": "action=search_chat_history 时的回看天数，最大 7。"},
+				"limit":       map[string]any{"type": "integer", "description": "action=search_chat_history 时的返回条数，最大 10。"},
 				"articleId":   map[string]any{"type": "integer", "description": "action=open_ithome_article 时的文章 ID。"},
 				"prompt":      map[string]any{"type": "string", "description": "图片、浏览器等工具的可选任务说明。"},
 				"action_text": map[string]any{"type": "string", "description": "App 子动作，例如 novel_app 的 upsert_entry/screen/create_project/open_project/append_draft。"},
@@ -265,13 +270,49 @@ func actDelegatedArguments(source map[string]any, action string) map[string]any 
 				break
 			}
 		}
+		if _, ok := args["action"]; !ok && action == "workspace_app" && workspaceWriteArgsPresent(args) {
+			args["action"] = "write"
+		}
 	}
 	return args
 }
 
+func directAppArguments(source map[string]any, appAction string) map[string]any {
+	args := cloneInvokeArguments(source)
+	if _, ok := args["action"]; !ok && isAppAction(appAction) {
+		for _, key := range []string{"action_text", "subaction", "operation", "op"} {
+			if value := commonString(args[key]); strings.TrimSpace(value) != "" {
+				args["action"] = normalizeAppSubaction(appAction, value)
+				break
+			}
+		}
+		if _, ok := args["action"]; !ok && appAction == "workspace_app" && workspaceWriteArgsPresent(args) {
+			args["action"] = "write"
+		}
+	}
+	return args
+}
+
+func cloneInvokeArguments(source map[string]any) map[string]any {
+	if len(source) == 0 {
+		return map[string]any{}
+	}
+	args := make(map[string]any, len(source))
+	for key, value := range source {
+		args[key] = value
+	}
+	return args
+}
+
+func workspaceWriteArgsPresent(args map[string]any) bool {
+	return strings.TrimSpace(commonString(args["text"])) != "" ||
+		strings.TrimSpace(commonString(args["title"])) != "" ||
+		strings.TrimSpace(commonString(args["kind"])) != ""
+}
+
 func isAppAction(action string) bool {
 	switch action {
-	case "todo_app", "novel_app", "project_app", "music_app", "news_app", "activity_app":
+	case "workspace_app", "todo_app", "novel_app", "project_app", "music_app", "news_app", "activity_app":
 		return true
 	default:
 		return false
@@ -281,6 +322,13 @@ func isAppAction(action string) bool {
 func normalizeAppSubaction(appAction, subaction string) string {
 	subaction = strings.TrimSpace(subaction)
 	switch appAction {
+	case "workspace_app":
+		switch subaction {
+		case "screen", "list":
+			return "overview"
+		case "journal", "diary", "draft", "drafts", "reading", "music":
+			return "write"
+		}
 	case "novel_app":
 		switch subaction {
 		case "list":
@@ -352,7 +400,7 @@ func (t DirectSubtool) Execute(ctx context.Context, call agentruntime.ToolCall) 
 	}
 	args := call.Arguments
 	if isAppAction(t.DefinitionValue.Name) {
-		args = actDelegatedArguments(call.Arguments, t.DefinitionValue.Name)
+		args = directAppArguments(call.Arguments, t.DefinitionValue.Name)
 	}
 	return t.Owner.ExecuteSubtool(ctx, t.DefinitionValue.Name, args, call)
 }
@@ -390,9 +438,6 @@ func (o CatalogSubtoolOwner) ExecuteSubtool(ctx context.Context, name string, ar
 	if o.Session != nil && name == "send_message" {
 		if target := o.Session.CurrentChatTarget(); target != nil {
 			targetType := strings.TrimSpace(commonString(args["targetType"]))
-			if targetType == "" {
-				targetType = strings.TrimSpace(commonString(args["groupType"]))
-			}
 			targetID := strings.TrimSpace(commonString(args["targetId"]))
 			if targetType == "" && targetID == "" {
 				args["targetType"] = target.Type

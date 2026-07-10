@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -263,6 +265,10 @@ func (g *NapcatGateway) handleEvent(payload map[string]any) {
 		eventTime = &tt
 	}
 	g.store.AddNapcatEvent(db.NapcatEventItem{PostType: postType, MessageType: messageType, SubType: subType, UserID: userID, GroupID: groupID, EventTime: eventTime, Payload: payload})
+	if postType == "notice" && common.AsString(payload["notice_type"]) == "group_ban" {
+		g.handleGroupBanNotice(payload, groupID, userID, subType, eventTime)
+		return
+	}
 	if postType != "message" || messageType == nil {
 		return
 	}
@@ -294,6 +300,37 @@ func (g *NapcatGateway) handleEvent(payload map[string]any) {
 	if eventTime != nil {
 		event.At = *eventTime
 	}
+	g.events.Enqueue(event)
+}
+
+func (g *NapcatGateway) handleGroupBanNotice(payload map[string]any, groupID, userID, subType *string, eventTime *time.Time) {
+	if groupID != nil && !contains(g.cfg.Server.Napcat.ListenGroupIDs, *groupID) {
+		g.store.Log("info", "NapCat group ban notice ignored by listenGroupIds", map[string]any{"event": "napcat.notice.group_ban.ignored_group", "groupId": *groupID, "listenGroupIds": g.cfg.Server.Napcat.ListenGroupIDs})
+		return
+	}
+	duration := valueInt(db.IntPtr(payload["duration"]))
+	operatorID := common.AsString(payload["operator_id"])
+	noticeSubType := valueOr(subType, common.AsString(payload["sub_type"]))
+	if noticeSubType == "" {
+		if duration > 0 {
+			noticeSubType = "ban"
+		} else {
+			noticeSubType = "lift_ban"
+		}
+	}
+	isSelf := strings.TrimSpace(g.cfg.Server.Bot.QQ) != "" && deref(userID) == strings.TrimSpace(g.cfg.Server.Bot.QQ)
+	event := rootagent.AgentEvent{Type: "napcat_group_ban_notice", Data: map[string]any{
+		"groupId":    deref(groupID),
+		"userId":     deref(userID),
+		"operatorId": operatorID,
+		"subType":    noticeSubType,
+		"duration":   duration,
+		"isSelf":     isSelf,
+	}}
+	if eventTime != nil {
+		event.At = *eventTime
+	}
+	g.store.Log("info", "NapCat group ban notice accepted", map[string]any{"event": "napcat.notice.group_ban.accepted", "groupId": deref(groupID), "userId": deref(userID), "operatorId": operatorID, "subType": noticeSubType, "duration": duration, "isSelf": isSelf})
 	g.events.Enqueue(event)
 }
 
@@ -468,6 +505,8 @@ func (g *NapcatGateway) normalizeMessageSegments(payload map[string]any, groupID
 						data["summary"] = description
 					}
 				}
+			case "":
+				item.Text = g.renderGenericFileSegment(context.Background(), groupID, data)
 			}
 		case "face":
 			item.Text = "[表情 " + common.AsString(data["id"]) + "]"
@@ -612,6 +651,133 @@ func (g *NapcatGateway) resolveFileURL(groupID string, data map[string]any) stri
 	}
 	payload, _ := result.(map[string]any)
 	return strings.TrimSpace(common.AsString(payload["url"]))
+}
+
+func (g *NapcatGateway) renderGenericFileSegment(ctx context.Context, groupID string, data map[string]any) string {
+	filename := firstNonEmpty(common.AsString(data["file"]), common.AsString(data["name"]), common.AsString(data["filename"]))
+	base := "[文件"
+	if filename != "" {
+		base += ": " + filename
+	}
+	base += "]"
+	fileURL := firstNonEmpty(common.AsString(data["url"]), g.resolveFileURL(groupID, data))
+	if fileURL == "" {
+		return base
+	}
+	data["url"] = fileURL
+	localPath, size, err := g.saveNapcatFile(ctx, fileURL, filename)
+	if err != nil {
+		g.store.Log("warn", "NapCat file save failed", map[string]any{
+			"event":    "napcat.file.save_failed",
+			"filename": filename,
+			"url":      truncateRunes(fileURL, 180),
+			"error":    err.Error(),
+		})
+		return base + "（下载失败）"
+	}
+	data["localFile"] = localPath
+	data["fileSize"] = size
+	text := base + "\n已保存: " + localPath
+	if size > 0 {
+		text += fmt.Sprintf("\n大小: %d 字节", size)
+	}
+	if preview, ok := textFilePreview(localPath); ok {
+		data["preview"] = preview
+		text += "\n[文件内容预览]\n" + preview
+	}
+	return text
+}
+
+func (g *NapcatGateway) saveNapcatFile(ctx context.Context, rawURL, filename string) (string, int64, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", 0, errors.New("empty file url")
+	}
+	if strings.HasPrefix(rawURL, "file://") {
+		path := strings.TrimPrefix(rawURL, "file://")
+		path = strings.TrimPrefix(path, "/")
+		if _, err := os.Stat(path); err == nil {
+			info, _ := os.Stat(path)
+			return path, info.Size(), nil
+		}
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		if info, err := os.Stat(rawURL); err == nil {
+			return rawURL, info.Size(), nil
+		}
+		return "", 0, fmt.Errorf("unsupported file url: %s", truncateRunes(rawURL, 80))
+	}
+	timeout := time.Duration(g.cfg.Server.Napcat.RequestTimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", 0, fmt.Errorf("download file returned %s", resp.Status)
+	}
+	const maxBytes int64 = 32 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return "", 0, err
+	}
+	if int64(len(body)) > maxBytes {
+		return "", 0, fmt.Errorf("file exceeds max download size %d bytes", maxBytes)
+	}
+	dir := filepath.Join("data", "napcat-files", time.Now().Format("2006-01"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", 0, err
+	}
+	name := sanitizeNapcatFilename(filename)
+	if name == "" {
+		name = "file.bin"
+	}
+	path := filepath.Join(dir, time.Now().Format("20060102-150405.000000000")+"-"+name)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return "", 0, err
+	}
+	return path, int64(len(body)), nil
+}
+
+func sanitizeNapcatFilename(filename string) string {
+	filename = strings.TrimSpace(filepath.Base(filename))
+	if filename == "." || filename == string(filepath.Separator) {
+		return ""
+	}
+	replacer := strings.NewReplacer("\\", "_", "/", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	filename = replacer.Replace(filename)
+	return strings.TrimSpace(filename)
+}
+
+func textFilePreview(path string) (string, bool) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".txt", ".md", ".json", ".jsonl", ".yaml", ".yml", ".csv", ".tsv", ".log", ".xml", ".html", ".htm", ".go", ".ts", ".tsx", ".js", ".jsx", ".py", ".java", ".cs", ".c", ".cpp", ".h", ".hpp", ".rs", ".sql":
+	default:
+		return "", false
+	}
+	const maxPreviewBytes int64 = 16 << 10
+	file, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	body, err := io.ReadAll(io.LimitReader(file, maxPreviewBytes+1))
+	if err != nil || len(body) == 0 || strings.ContainsRune(string(body), '\x00') {
+		return "", false
+	}
+	text := strings.ToValidUTF8(string(body), "�")
+	if int64(len(body)) > maxPreviewBytes {
+		text = truncateRunes(text, int(maxPreviewBytes)) + "\n……文件后续内容已省略"
+	}
+	return strings.TrimSpace(text), strings.TrimSpace(text) != ""
 }
 
 func mediaKindFromFilename(filename string) string {

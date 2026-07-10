@@ -123,11 +123,11 @@ func (t NovelTool) Execute(_ context.Context, call agentruntime.ToolCall) (agent
 		}
 		return result(payload), nil
 	case "append_draft":
-		err := t.Service.AppendProjectText(t.Service.ResolveNovelProjectID(projectID), "draft.md", stringArg(call.Arguments, "text"))
-		return okErr(err), nil
+		write, err := t.Service.AppendProjectTextDetailed(t.Service.ResolveNovelProjectID(projectID), "draft.md", stringArg(call.Arguments, "text"))
+		return jsonErrOr("write", write, err), nil
 	case "append_note":
-		err := t.Service.AppendProjectText(t.Service.ResolveNovelProjectID(projectID), "notes.md", stringArg(call.Arguments, "text"))
-		return okErr(err), nil
+		write, err := t.Service.AppendProjectTextDetailed(t.Service.ResolveNovelProjectID(projectID), "notes.md", stringArg(call.Arguments, "text"))
+		return jsonErrOr("write", write, err), nil
 	case "update_outline":
 		err := t.Service.ReplaceProjectText(t.Service.ResolveNovelProjectID(projectID), "outline.md", stringArg(call.Arguments, "text"))
 		return okErr(err), nil
@@ -162,11 +162,11 @@ func (t ProjectTool) Execute(_ context.Context, call agentruntime.ToolCall) (age
 		projects, err := t.Service.ListProjects(stringArg(call.Arguments, "kind"))
 		return jsonErrOr("projects", projects, err), nil
 	case "append_note":
-		err := t.Service.AppendProjectText(stringArg(call.Arguments, "projectId"), "notes.md", stringArg(call.Arguments, "text"))
-		return okErr(err), nil
+		write, err := t.Service.AppendProjectTextDetailed(stringArg(call.Arguments, "projectId"), "notes.md", stringArg(call.Arguments, "text"))
+		return jsonErrOr("write", write, err), nil
 	case "append_journal":
-		err := t.Service.AppendProjectText(stringArg(call.Arguments, "projectId"), "journal.md", stringArg(call.Arguments, "text"))
-		return okErr(err), nil
+		write, err := t.Service.AppendProjectTextDetailed(stringArg(call.Arguments, "projectId"), "journal.md", stringArg(call.Arguments, "text"))
+		return jsonErrOr("write", write, err), nil
 	default:
 		screen, err := t.Service.Screen("projects")
 		return jsonErrOr("screen", screen, err), nil

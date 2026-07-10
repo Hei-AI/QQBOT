@@ -27,6 +27,15 @@ type Project struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
+type ProjectWriteResult struct {
+	Project      Project `json:"project"`
+	File         string  `json:"file"`
+	FilePath     string  `json:"filePath"`
+	BytesWritten int     `json:"bytesWritten"`
+	Verified     bool    `json:"verified"`
+	UpdatedAt    string  `json:"updatedAt"`
+}
+
 type TodoItem struct {
 	ID        string `json:"id"`
 	Text      string `json:"text"`
@@ -190,11 +199,11 @@ func (s *Service) CreateProject(kind, title string) (Project, error) {
 	if err := os.MkdirAll(s.projectDir(project.ID), 0755); err != nil {
 		return Project{}, err
 	}
-	_ = s.appendProjectFile(project.ID, "notes.md", "# Notes\n")
-	_ = s.appendProjectFile(project.ID, "journal.md", "# Journal\n")
+	_, _, _ = s.appendProjectFile(project.ID, "notes.md", "# Notes\n")
+	_, _, _ = s.appendProjectFile(project.ID, "journal.md", "# Journal\n")
 	if kind == "novel" {
-		_ = s.appendProjectFile(project.ID, "outline.md", "# Outline\n")
-		_ = s.appendProjectFile(project.ID, "draft.md", "# Draft\n")
+		_, _, _ = s.appendProjectFile(project.ID, "outline.md", "# Outline\n")
+		_, _, _ = s.appendProjectFile(project.ID, "draft.md", "# Draft\n")
 		state, _ := s.loadState()
 		if state.ActiveNovelProjectID == "" || !projectIDExists(projects, state.ActiveNovelProjectID) {
 			state.ActiveNovelProjectID = project.ID
@@ -321,23 +330,55 @@ func (s *Service) OpenNovelProjectWithFallback(projectID string) (Project, bool,
 }
 
 func (s *Service) AppendProjectText(projectID, file, text string) error {
+	_, err := s.AppendProjectTextDetailed(projectID, file, text)
+	return err
+}
+
+func (s *Service) AppendProjectTextDetailed(projectID, file, text string) (ProjectWriteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensure(); err != nil {
-		return err
+		return ProjectWriteResult{}, err
 	}
 	project, err := s.findProject(s.resolveProjectID(projectID))
 	if err != nil {
-		return err
+		return ProjectWriteResult{}, err
 	}
 	file = allowedProjectFile(file)
 	if file == "" {
-		return errors.New("unsupported project file")
+		return ProjectWriteResult{}, errors.New("unsupported project file")
 	}
-	if err := s.appendProjectFile(project.ID, file, "\n"+strings.TrimSpace(text)+"\n"); err != nil {
-		return err
+	appendText := "\n" + strings.TrimSpace(text) + "\n"
+	bytesWritten, filePath, err := s.appendProjectFile(project.ID, file, appendText)
+	if err != nil {
+		return ProjectWriteResult{}, err
 	}
-	return s.touchProject(project.ID)
+	if bytesWritten <= 0 {
+		return ProjectWriteResult{}, errors.New("write completed with zero bytes")
+	}
+	if err := verifyProjectWrite(filePath, appendText); err != nil {
+		return ProjectWriteResult{}, err
+	}
+	updatedAt := nowText()
+	projects, _ := s.loadProjects("")
+	for i := range projects {
+		if projects[i].ID == project.ID {
+			projects[i].UpdatedAt = updatedAt
+			project = projects[i]
+			if err := s.saveProjects(projects); err != nil {
+				return ProjectWriteResult{}, err
+			}
+			break
+		}
+	}
+	return ProjectWriteResult{
+		Project:      project,
+		File:         file,
+		FilePath:     filePath,
+		BytesWritten: bytesWritten,
+		Verified:     true,
+		UpdatedAt:    project.UpdatedAt,
+	}, nil
 }
 
 func (s *Service) ResolveNovelProjectID(projectID string) string {
@@ -613,7 +654,7 @@ func (s *Service) UpsertNovelEntry(projectID, title, text, file string) (Project
 	if err != nil {
 		return Project{}, false, err
 	}
-	if err := s.appendProjectFile(project.ID, file, "\n"+text+"\n"); err != nil {
+	if _, _, err := s.appendProjectFile(project.ID, file, "\n"+text+"\n"); err != nil {
 		return Project{}, created, err
 	}
 	if err := s.touchProject(project.ID); err != nil {
@@ -844,10 +885,10 @@ func (s *Service) resolveOrCreateNovelProjectLocked(projectID, title string) (Pr
 	if err := s.saveProjects(projects); err != nil {
 		return Project{}, false, err
 	}
-	_ = s.appendProjectFile(project.ID, "outline.md", "# Outline\n")
-	_ = s.appendProjectFile(project.ID, "notes.md", "# Notes\n")
-	_ = s.appendProjectFile(project.ID, "draft.md", "# Draft\n")
-	_ = s.appendProjectFile(project.ID, "journal.md", "# Journal\n")
+	_, _, _ = s.appendProjectFile(project.ID, "outline.md", "# Outline\n")
+	_, _, _ = s.appendProjectFile(project.ID, "notes.md", "# Notes\n")
+	_, _, _ = s.appendProjectFile(project.ID, "draft.md", "# Draft\n")
+	_, _, _ = s.appendProjectFile(project.ID, "journal.md", "# Journal\n")
 	return project, true, nil
 }
 
@@ -900,20 +941,40 @@ func (s *Service) touchProject(id string) error {
 	return nil
 }
 
-func (s *Service) appendProjectFile(projectID, file, text string) error {
+func (s *Service) appendProjectFile(projectID, file, text string) (int, string, error) {
 	if strings.TrimSpace(text) == "" {
-		return nil
+		return 0, "", nil
 	}
 	if err := os.MkdirAll(s.projectDir(projectID), 0755); err != nil {
-		return err
+		return 0, "", err
 	}
-	f, err := os.OpenFile(filepath.Join(s.projectDir(projectID), file), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	path := filepath.Join(s.projectDir(projectID), file)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return 0, "", err
+	}
+	bytesWritten, err := f.WriteString(text)
+	if err != nil {
+		return bytesWritten, path, err
+	}
+	if err := f.Close(); err != nil {
+		return bytesWritten, path, err
+	}
+	if absPath, absErr := filepath.Abs(path); absErr == nil {
+		path = absPath
+	}
+	return bytesWritten, path, nil
+}
+
+func verifyProjectWrite(path, text string) error {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = f.WriteString(text)
-	return err
+	if !strings.Contains(string(data), strings.TrimSpace(text)) {
+		return fmt.Errorf("write verification failed for %s", path)
+	}
+	return nil
 }
 
 func (s *Service) loadTodos() ([]TodoItem, error) {

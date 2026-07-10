@@ -4,6 +4,7 @@ import (
 	"QqBot/internal/agentruntime"
 	"QqBot/internal/capabilities/airadar"
 	browsercap "QqBot/internal/capabilities/browser"
+	"QqBot/internal/capabilities/chathistory"
 	"QqBot/internal/capabilities/magnetsearch"
 	"QqBot/internal/capabilities/messaging"
 	"QqBot/internal/capabilities/news"
@@ -34,21 +35,17 @@ func buildBusinessTools(cfg *config.Config, store *db.Store, sender messaging.Se
 	searchService := websearch.URLAwareService{
 		Fallback: websearch.TavilyService{APIKey: cfg.Server.Tavily.APIKey},
 	}
-	aiToneEnabled := cfg.Server.Agent.AITone.EnabledValue()
-	var aiToneClassifier *airadar.Classifier
-	if aiToneEnabled {
-		var err error
-		aiToneClassifier, err = airadar.NewDefaultClassifier()
-		if err != nil {
-			store.Log("error", "AIRadar model load failed", map[string]any{"event": "airadar.model.load_failed", "error": err.Error()})
-		}
+	aiToneClassifier, err := airadar.NewDefaultClassifier()
+	if err != nil {
+		store.Log("error", "AIRadar model load failed", map[string]any{"event": "airadar.model.load_failed", "error": err.Error()})
 	}
 	catalog := agentruntime.NewToolCatalog(
-		sendMessageTool{sender: sender, store: store, screenshotDir: cfg.Server.Browser.ScreenshotDir, aiToneClassifier: aiToneClassifier, aiToneThreshold: cfg.Server.Agent.AITone.Threshold, aiToneDisabled: !aiToneEnabled},
+		sendMessageTool{sender: sender, store: store, screenshotDir: cfg.Server.Browser.ScreenshotDir, aiToneClassifier: aiToneClassifier, aiToneThreshold: cfg.Server.Agent.AIToneThreshold},
 		analyzeImageTool{vision: vision.Agent{Client: llmClient}, requester: requesterFromSender(sender), screenshotDir: cfg.Server.Browser.ScreenshotDir},
 		airadar.DetectTool{Classifier: aiToneClassifier},
 		news.OpenIthomeArticleTool{Store: storeNewsStore{store: store}},
 		storycap.SearchMemoryTool{Service: storyService, TopK: cfg.Server.Agent.Story.Memory.Retrieval.TopK},
+		chathistory.SearchTool{Store: store},
 		&WebSearchTaskAgentTool{service: searchService},
 		personalapp.ScreenTool{Service: personal},
 		personalapp.TodoTool{Service: personal},
@@ -169,11 +166,10 @@ type sendMessageTool struct {
 	screenshotDir    string
 	aiToneClassifier *airadar.Classifier
 	aiToneThreshold  float64
-	aiToneDisabled   bool
 }
 
 func (t sendMessageTool) Definition() agentruntime.ToolDefinition {
-	return agentruntime.ToolDefinition{Name: "send_message", Description: "向指定群聊或私聊发送消息；省略目标时回复最新一条 QQ 消息所在会话。", Parameters: agentruntime.ObjectSchema(map[string]any{
+	return agentruntime.ToolDefinition{Name: "send_message", Description: "向指定群聊或私聊发送消息；必须填写 targetType 和 targetId，取自要回复的 qq_message 标签。", Parameters: agentruntime.ObjectSchema(map[string]any{
 		"targetType": map[string]any{"type": "string", "enum": []string{"group", "private"}, "description": "回复路由类型，对应 qq_message 的 target_type。"},
 		"targetId":   map[string]any{"type": "string", "description": "回复路由 ID，对应 qq_message 的 target_id。"},
 		"message":    map[string]any{"type": "string", "description": "要发送的消息内容。"},
@@ -187,14 +183,7 @@ func (t sendMessageTool) Execute(_ context.Context, call agentruntime.ToolCall) 
 	if t.sender == nil {
 		return agentruntime.ToolResult{}, fmt.Errorf("消息发送器不可用")
 	}
-	targetType, _ := call.Arguments["targetType"].(string)
-	targetType = strings.TrimSpace(targetType)
-	if targetType == "" {
-		groupType, _ := call.Arguments["groupType"].(string)
-		targetType = strings.TrimSpace(groupType)
-	}
-	targetID, _ := call.Arguments["targetId"].(string)
-	targetID = strings.TrimSpace(targetID)
+	targetType, targetID := sendMessageTarget(call.Arguments)
 	message, _ := call.Arguments["message"].(string)
 	imagePath, _ := call.Arguments["imagePath"].(string)
 	if strings.TrimSpace(imagePath) != "" {
@@ -227,10 +216,37 @@ func (t sendMessageTool) Execute(_ context.Context, call agentruntime.ToolCall) 
 	return agentruntime.ToolResult{Kind: "business", Content: string(data)}, err
 }
 
-func (t sendMessageTool) blockHighAITone(message string) *agentruntime.ToolResult {
-	if t.aiToneDisabled {
-		return nil
+func sendMessageTarget(args map[string]any) (string, string) {
+	targetType := strings.TrimSpace(sendMessageStringArg(args, "targetType", "target_type", "messageType", "groupType"))
+	targetID := strings.TrimSpace(sendMessageStringArg(args, "targetId", "target_id"))
+	if targetType == "" {
+		if groupID := strings.TrimSpace(sendMessageStringArg(args, "groupId", "group_id")); groupID != "" {
+			targetType = "group"
+			targetID = groupID
+		} else if userID := strings.TrimSpace(sendMessageStringArg(args, "userId", "user_id", "privateUserId", "private_user_id")); userID != "" {
+			targetType = "private"
+			targetID = userID
+		}
 	}
+	switch targetType {
+	case "qq_group":
+		targetType = "group"
+	case "qq_private":
+		targetType = "private"
+	}
+	return targetType, targetID
+}
+
+func sendMessageStringArg(args map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := args[key].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (t sendMessageTool) blockHighAITone(message string) *agentruntime.ToolResult {
 	text := strings.TrimSpace(stripCQSegments(message))
 	if text == "" {
 		return nil
@@ -246,7 +262,7 @@ func (t sendMessageTool) blockHighAITone(message string) *agentruntime.ToolResul
 	}
 	threshold := t.aiToneThreshold
 	if threshold <= 0 {
-		threshold = 0.65
+		threshold = 0.7
 	}
 	result := classifier.Predict(text, threshold)
 	t.logAIToneCheck(text, result.Prob, threshold, result.Prob > threshold)

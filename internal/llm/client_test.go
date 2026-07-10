@@ -24,6 +24,9 @@ func TestVisionAttemptSupportsImages(t *testing.T) {
 	if !visionAttemptSupportsImages("google", "gemini-3.5-flash") {
 		t.Fatal("gemini should be treated as image-capable")
 	}
+	if !visionAttemptSupportsImages("longcat", "LongCat-2.0") {
+		t.Fatal("longcat anthropic-compatible vision should be treated as image-capable")
+	}
 }
 
 func TestOpenAIChatPayloadIncludesMaxTokens(t *testing.T) {
@@ -104,6 +107,97 @@ func TestLongCatChatCompletionsURLAcceptsOfficialSDKBaseURL(t *testing.T) {
 	want := "https://api.longcat.chat/openai/v1/chat/completions"
 	if got != want {
 		t.Fatalf("unexpected LongCat URL: got %q want %q", got, want)
+	}
+}
+
+func TestLongCatAnthropicMessagesURLFromOpenAIBaseURL(t *testing.T) {
+	got := longCatAnthropicMessagesURL("https://api.longcat.chat/openai/v1")
+	want := "https://api.longcat.chat/anthropic/v1/messages"
+	if got != want {
+		t.Fatalf("unexpected LongCat Anthropic URL: got %q want %q", got, want)
+	}
+}
+
+func TestLongCatAnthropicVisionUsesMessagesEndpoint(t *testing.T) {
+	imageData := []byte("image")
+	var gotPath string
+	var gotAuth string
+	var gotVersion string
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotVersion = r.Header.Get("Anthropic-Version")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg-test","type":"message","role":"assistant","model":"LongCat-2.0","content":[{"type":"text","text":"blue"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	client := &LLMClient{
+		cfg: &config.Config{Server: config.ServerConfig{LLM: config.LLMConfig{Providers: config.LLMProvidersConfig{
+			LongCat: config.LLMProviderConfig{APIKey: "longcat-key", BaseURL: server.URL + "/openai/v1", Models: []string{"LongCat-2.0"}},
+		}}}},
+		http: server.Client(),
+	}
+	resp, err := client.callLongCatAnthropicVision(context.Background(), LLMChatRequest{
+		Provider:  "longcat",
+		Model:     "LongCat-2.0",
+		MaxTokens: 64,
+		System:    "vision sys",
+		Messages: []LLMMessage{{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "text", "text": "color?"},
+				map[string]any{"type": "image", "mimeType": "image/png", "dataUrl": "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageData)},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/anthropic/v1/messages" {
+		t.Fatalf("unexpected LongCat vision path: %s", gotPath)
+	}
+	if gotAuth != "Bearer longcat-key" {
+		t.Fatalf("unexpected auth header: %q", gotAuth)
+	}
+	if gotVersion != "2023-06-01" {
+		t.Fatalf("missing Anthropic-Version header: %q", gotVersion)
+	}
+	if gotPayload["model"] != "LongCat-2.0" || gotPayload["max_tokens"] != float64(64) || gotPayload["system"] != "vision sys" {
+		t.Fatalf("unexpected payload header fields: %#v", gotPayload)
+	}
+	messages := gotPayload["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	image := content[1].(map[string]any)
+	source := image["source"].(map[string]any)
+	if image["type"] != "image" || source["media_type"] != "image/png" || source["data"] != base64.StdEncoding.EncodeToString(imageData) {
+		t.Fatalf("unexpected image block: %#v", image)
+	}
+	message := resp["message"].(map[string]any)
+	if resp["provider"] != "longcat" || message["content"] != "blue" {
+		t.Fatalf("unexpected response: %#v", resp)
+	}
+}
+
+func TestVisionNoImageResponseIsRejected(t *testing.T) {
+	cases := []string{
+		"抱歉，我没有看到你发的图片。请重新发送图片。",
+		"没看到 请重新发",
+		"当前没有在输入中检测到可供描述的图片内容。请直接发送需要描述的图片。",
+		"I cannot see the image.",
+		"image was not provided",
+	}
+	for _, content := range cases {
+		if !isVisionNoImageResponse(content) {
+			t.Fatalf("expected no-image response to be rejected: %q", content)
+		}
+	}
+	if isVisionNoImageResponse("一只白色小猫趴在窗台上。") {
+		t.Fatal("valid image description should not be rejected")
 	}
 }
 

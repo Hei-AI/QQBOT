@@ -24,6 +24,7 @@ type ToolCall struct {
 // NormalizeToolCall applies compatibility repairs to model tool calls before
 // logging, persistence, and execution.
 func NormalizeToolCall(call ToolCall) ToolCall {
+	call.Arguments = repairTaggedToolArguments(call.Arguments)
 	call.Arguments = withoutOSArgument(call.Arguments)
 	if call.Name == "send_message" && strings.EqualFold(strings.TrimSpace(asString(call.Arguments["action"])), "wait") {
 		call.Name = "wait"
@@ -74,7 +75,7 @@ func normalizeLegacyRootToolCall(call ToolCall) ToolCall {
 
 func legacyRootActionName(name string) string {
 	switch strings.TrimSpace(name) {
-	case "wait", "send_message", "analyze_image", "detect_ai_tone", "browser", "search_web", "search_memory", "searchMagnetFromWeb", "open_ithome_article", "enter", "back_to_portal", "help", "personal_screen", "workspace_app", "todo_app", "novel_app", "project_app", "music_app", "news_app", "calculate", "bash", "read_bash_output":
+	case "wait", "send_message", "analyze_image", "detect_ai_tone", "browser", "search_web", "search_memory", "search_chat_history", "searchMagnetFromWeb", "open_ithome_article", "enter", "back_to_portal", "help", "personal_screen", "workspace_app", "todo_app", "novel_app", "project_app", "music_app", "news_app", "calculate", "bash", "read_bash_output":
 		return strings.TrimSpace(name)
 	case "send", "sendMessage", "send_group_message", "send_private_message":
 		return "send_message"
@@ -106,6 +107,48 @@ func legacyRootAlias(name string) string {
 	default:
 		return ""
 	}
+}
+
+func repairTaggedToolArguments(arguments map[string]any) map[string]any {
+	if len(arguments) == 0 {
+		return arguments
+	}
+	const (
+		keyCloseTag = "</longcat_arg_key>"
+		valueTag    = "<longcat_arg_value>"
+		keyOpenTag  = "<longcat_arg_key>"
+	)
+	needsRepair := false
+	for key := range arguments {
+		if strings.Contains(key, keyCloseTag) || strings.Contains(key, valueTag) || strings.Contains(key, keyOpenTag) {
+			needsRepair = true
+			break
+		}
+	}
+	if !needsRepair {
+		return arguments
+	}
+	next := make(map[string]any, len(arguments)+2)
+	for key, value := range arguments {
+		if !strings.Contains(key, keyCloseTag) || !strings.Contains(key, valueTag) {
+			cleanKey := strings.TrimPrefix(strings.TrimSpace(key), keyOpenTag)
+			if cleanKey != "" {
+				next[cleanKey] = value
+			}
+			continue
+		}
+		before, after, _ := strings.Cut(key, keyCloseTag)
+		firstKey := strings.TrimPrefix(strings.TrimSpace(before), keyOpenTag)
+		firstValue, tail, _ := strings.Cut(after, valueTag)
+		if firstKey != "" {
+			next[firstKey] = strings.TrimSpace(firstValue)
+		}
+		nextKey := strings.TrimPrefix(strings.TrimSpace(tail), keyOpenTag)
+		if nextKey != "" {
+			next[nextKey] = value
+		}
+	}
+	return next
 }
 
 func cloneArguments(arguments map[string]any) map[string]any {
@@ -213,14 +256,6 @@ func (c *ToolCatalog) Pick(names ...string) *ToolCatalog {
 
 // Execute 分发模型工具调用，并把普通错误转换成 JSON 工具内容。
 func (c *ToolCatalog) Execute(ctx context.Context, call ToolCall) (ToolResult, error) {
-	result, err := c.ExecuteRaw(ctx, call)
-	if err != nil {
-		return c.ErrorResult(call, err), nil
-	}
-	return result, nil
-}
-
-func (c *ToolCatalog) ExecuteRaw(ctx context.Context, call ToolCall) (ToolResult, error) {
 	tool, ok := c.Get(call.Name)
 	if !ok {
 		return ToolResult{Kind: "control", Content: mustJSON(map[string]any{"ok": false, "error": "UNKNOWN_TOOL", "toolName": call.Name})}, nil
@@ -240,17 +275,9 @@ func (c *ToolCatalog) ExecuteRaw(ctx context.Context, call ToolCall) (ToolResult
 		c.observer.AfterTool(ctx, call, definition, result, err)
 	}
 	if err != nil {
-		return ToolResult{Kind: tool.Kind()}, err
+		return ToolResult{Kind: tool.Kind(), Content: mustJSON(map[string]any{"ok": false, "error": "TOOL_FAILED", "toolName": call.Name, "message": err.Error()})}, nil
 	}
 	return result, nil
-}
-
-func (c *ToolCatalog) ErrorResult(call ToolCall, err error) ToolResult {
-	kind := "business"
-	if tool, ok := c.Get(call.Name); ok {
-		kind = tool.Kind()
-	}
-	return ToolResult{Kind: kind, Content: mustJSON(map[string]any{"ok": false, "error": "TOOL_FAILED", "toolName": call.Name, "message": err.Error()})}
 }
 
 // ObjectSchema 创建工具定义使用的 JSON Schema 外壳。

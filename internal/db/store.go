@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -86,6 +87,34 @@ type LlmCallItem struct {
 	CreatedAt             time.Time      `json:"createdAt"`
 }
 
+// LlmTokenUsageItem 是 LLM usage 的每日结构化计数记录。
+type LlmTokenUsageItem struct {
+	ID               int       `json:"id"`
+	Date             string    `json:"date"`
+	Calls            int       `json:"calls"`
+	InputTokens      int       `json:"inputTokens"`
+	OutputTokens     int       `json:"outputTokens"`
+	CacheWriteTokens int       `json:"cacheWriteTokens"`
+	CacheReadTokens  int       `json:"cacheReadTokens"`
+	TotalTokens      int       `json:"totalTokens"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+type LlmTokenUsageBucket struct {
+	Calls      int `json:"calls"`
+	Input      int `json:"input"`
+	Output     int `json:"output"`
+	CacheWrite int `json:"cacheWrite"`
+	CacheRead  int `json:"cacheRead"`
+	Total      int `json:"total"`
+}
+
+type LlmTokenUsageSummary struct {
+	GeneratedAt time.Time           `json:"generatedAt"`
+	Total       LlmTokenUsageBucket `json:"total"`
+	Recent      []LlmTokenUsageItem `json:"recent"`
+}
+
 // NapcatEventItem 对应持久化的 NapCat 原始 post-type 事件。
 type NapcatEventItem struct {
 	ID          int            `json:"id"`
@@ -114,6 +143,17 @@ type NapcatMessageItem struct {
 	EventTime       *time.Time       `json:"eventTime"`
 	Payload         map[string]any   `json:"payload"`
 	CreatedAt       time.Time        `json:"createdAt"`
+}
+
+// ChatHistoryQuery 限定原始 QQ 聊天记录的检索范围。
+// Days 会被限制在 1 到 7 天，防止业务工具意外读取过久的聊天记录。
+type ChatHistoryQuery struct {
+	Query       string
+	MessageType string
+	TargetID    string
+	UserID      string
+	Days        int
+	Limit       int
 }
 
 type MessageSegment struct {
@@ -349,6 +389,9 @@ func (s *Store) initSchema() error {
 		`PRAGMA busy_timeout = 5000`,
 		`CREATE TABLE IF NOT EXISTS app_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS llm_calls (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
+		`DROP TABLE IF EXISTS llm_token_usage`,
+		`CREATE TABLE IF NOT EXISTS llm_token_usage_daily (id INTEGER PRIMARY KEY AUTOINCREMENT, usage_date TEXT NOT NULL UNIQUE, calls INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_llm_token_usage_daily_date ON llm_token_usage_daily(usage_date)`,
 		`CREATE TABLE IF NOT EXISTS napcat_events (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS napcat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, item TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS idx_napcat_messages_type_group ON napcat_messages(json_extract(item, '$.messageType'), json_extract(item, '$.groupId'), id)`,
@@ -636,8 +679,35 @@ func (s *Store) AddLlmCall(item LlmCallItem) {
 	item = compactLlmCall(item)
 	s.mu.Lock()
 	_, _ = s.insertJSONAutoID("llm_calls", item.CreatedAt, &item)
+	s.insertLlmTokenUsageLocked(item)
 	s.pruneTable("llm_calls", maxStoredLlmCalls)
 	s.mu.Unlock()
+}
+
+func (s *Store) insertLlmTokenUsageLocked(item LlmCallItem) {
+	usageItem, ok := llmTokenUsageFromCall(item)
+	if !ok {
+		return
+	}
+	_, _ = s.db.Exec(
+		`INSERT INTO llm_token_usage_daily(usage_date, calls, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, total_tokens, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(usage_date) DO UPDATE SET
+			calls = calls + excluded.calls,
+			input_tokens = input_tokens + excluded.input_tokens,
+			output_tokens = output_tokens + excluded.output_tokens,
+			cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
+			cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+			total_tokens = total_tokens + excluded.total_tokens,
+			updated_at = excluded.updated_at`,
+		usageItem.Date,
+		usageItem.Calls,
+		usageItem.InputTokens,
+		usageItem.OutputTokens,
+		usageItem.CacheWriteTokens,
+		usageItem.CacheReadTokens,
+		usageItem.TotalTokens,
+		formatTime(usageItem.UpdatedAt),
+	)
 }
 
 func (s *Store) AddNapcatEvent(item NapcatEventItem) {
@@ -648,6 +718,62 @@ func (s *Store) AddNapcatEvent(item NapcatEventItem) {
 	_, _ = s.insertJSONAutoID("napcat_events", item.CreatedAt, &item)
 	s.pruneTable("napcat_events", maxStoredNapcatEvents)
 	s.mu.Unlock()
+}
+
+func (s *Store) LLMTokenUsageSummary(startAt, endAt *time.Time) LlmTokenUsageSummary {
+	summary := LlmTokenUsageSummary{
+		GeneratedAt: time.Now(),
+		Recent:      []LlmTokenUsageItem{},
+	}
+	if s == nil || s.db == nil {
+		return summary
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	query := `SELECT id, usage_date, calls, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, total_tokens, updated_at FROM llm_token_usage_daily`
+	args := []any{}
+	if startAt != nil || endAt != nil {
+		clauses := []string{}
+		if startAt != nil {
+			clauses = append(clauses, "usage_date >= ?")
+			args = append(args, startAt.In(time.Local).Format("2006-01-02"))
+		}
+		if endAt != nil {
+			clauses = append(clauses, "usage_date < ?")
+			args = append(args, endAt.In(time.Local).Format("2006-01-02"))
+		}
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	query += " ORDER BY usage_date ASC"
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return summary
+	}
+	defer rows.Close()
+	recent := []LlmTokenUsageItem{}
+	for rows.Next() {
+		item, ok := scanLlmTokenUsage(rows)
+		if !ok {
+			continue
+		}
+		bucket := LlmTokenUsageBucket{
+			Calls:      item.Calls,
+			Input:      item.InputTokens,
+			Output:     item.OutputTokens,
+			CacheWrite: item.CacheWriteTokens,
+			CacheRead:  item.CacheReadTokens,
+			Total:      item.TotalTokens,
+		}
+		addLlmTokenUsage(&summary.Total, bucket)
+		recent = append(recent, item)
+		if len(recent) > 20 {
+			recent = recent[1:]
+		}
+	}
+	for i := len(recent) - 1; i >= 0; i-- {
+		summary.Recent = append(summary.Recent, recent[i])
+	}
+	return summary
 }
 
 func (s *Store) AddNapcatMessage(item NapcatMessageItem) int {
@@ -767,6 +893,58 @@ func (s *Store) RecentNapcatMessages(messageType, id string, limit int) []Napcat
 	}
 	query += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := queryJSONRows[NapcatMessageItem](s.db, query, args...)
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+	return items
+}
+
+// SearchNapcatMessages 在最近七天内检索持久化的原始 QQ 消息。
+// 返回顺序为从旧到新，便于模型直接阅读一小段对话。
+func (s *Store) SearchNapcatMessages(input ChatHistoryQuery) []NapcatMessageItem {
+	days := input.Days
+	if days <= 0 || days > 7 {
+		days = 7
+	}
+	limit := input.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+	if limit > 10 {
+		limit = 10
+	}
+
+	query := `SELECT item FROM napcat_messages WHERE created_at >= ?`
+	args := []any{formatTime(time.Now().AddDate(0, 0, -days))}
+	if messageType := strings.TrimSpace(input.MessageType); messageType != "" {
+		query += ` AND json_extract(item, '$.messageType') = ?`
+		args = append(args, messageType)
+		if targetID := strings.TrimSpace(input.TargetID); targetID != "" {
+			if messageType == "group" {
+				query += ` AND json_extract(item, '$.groupId') = ?`
+			} else if messageType == "private" {
+				query += ` AND json_extract(item, '$.userId') = ?`
+			}
+			args = append(args, targetID)
+		}
+	}
+	if userID := strings.TrimSpace(input.UserID); userID != "" {
+		query += ` AND json_extract(item, '$.userId') = ?`
+		args = append(args, userID)
+	}
+	if keyword := strings.TrimSpace(input.Query); keyword != "" {
+		query += ` AND (instr(lower(COALESCE(json_extract(item, '$.rawMessage'), '')), lower(?)) > 0 OR instr(lower(COALESCE(json_extract(item, '$.nickname'), '')), lower(?)) > 0)`
+		args = append(args, keyword, keyword)
+	} else if strings.TrimSpace(input.MessageType) == "" && strings.TrimSpace(input.UserID) == "" {
+		// 未给关键词时必须至少锁定一个会话或发送者，避免模型漫无目的翻聊天记录。
+		return nil
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items := queryJSONRows[NapcatMessageItem](s.db, query, args...)
@@ -1393,6 +1571,110 @@ func compactMapPayload(value map[string]any) map[string]any {
 		}
 	}
 	return out
+}
+
+func llmTokenUsageFromCall(item LlmCallItem) (LlmTokenUsageItem, bool) {
+	usage := mapFromAny(item.ResponsePayload["usage"])
+	if len(usage) == 0 {
+		usage = mapFromAny(item.NativeResponsePayload["usage"])
+	}
+	if item.CreatedAt.IsZero() {
+		item.CreatedAt = time.Now()
+	}
+	out := LlmTokenUsageItem{
+		Date:             item.CreatedAt.In(time.Local).Format("2006-01-02"),
+		Calls:            1,
+		InputTokens:      int(tokenNumber(usage["promptTokens"])),
+		OutputTokens:     int(tokenNumber(usage["completionTokens"])),
+		CacheReadTokens:  int(tokenNumber(usage["cacheHitTokens"])),
+		CacheWriteTokens: int(tokenNumber(usage["cacheMissTokens"])),
+		TotalTokens:      int(tokenNumber(usage["totalTokens"])),
+		UpdatedAt:        item.CreatedAt,
+	}
+	if out.InputTokens == 0 {
+		out.InputTokens = int(tokenNumber(usage["prompt_tokens"]) + tokenNumber(usage["input_tokens"]))
+	}
+	if out.OutputTokens == 0 {
+		out.OutputTokens = int(tokenNumber(usage["completion_tokens"]) + tokenNumber(usage["output_tokens"]))
+	}
+	if out.CacheReadTokens == 0 {
+		out.CacheReadTokens = int(tokenNumber(usage["prompt_cache_hit_tokens"]) + tokenNumber(usage["cache_read_input_tokens"]))
+		if details := mapFromAny(usage["prompt_tokens_details"]); len(details) > 0 {
+			out.CacheReadTokens += int(tokenNumber(details["cached_tokens"]))
+		}
+	}
+	if out.CacheWriteTokens == 0 {
+		out.CacheWriteTokens = int(tokenNumber(usage["prompt_cache_miss_tokens"]) + tokenNumber(usage["cache_creation_input_tokens"]))
+	}
+	if out.TotalTokens == 0 {
+		out.TotalTokens = out.InputTokens + out.OutputTokens
+	}
+	if out.InputTokens == 0 && out.OutputTokens == 0 && out.CacheReadTokens == 0 && out.CacheWriteTokens == 0 && out.TotalTokens == 0 {
+		return LlmTokenUsageItem{}, false
+	}
+	return out, true
+}
+
+func scanLlmTokenUsage(rows *sql.Rows) (LlmTokenUsageItem, bool) {
+	var item LlmTokenUsageItem
+	var updatedAt string
+	if rows.Scan(
+		&item.ID,
+		&item.Date,
+		&item.Calls,
+		&item.InputTokens,
+		&item.OutputTokens,
+		&item.CacheWriteTokens,
+		&item.CacheReadTokens,
+		&item.TotalTokens,
+		&updatedAt,
+	) != nil {
+		return LlmTokenUsageItem{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
+		item.UpdatedAt = parsed
+	}
+	return item, true
+}
+
+func addLlmTokenUsage(dst *LlmTokenUsageBucket, src LlmTokenUsageBucket) {
+	dst.Calls += src.Calls
+	dst.Input += src.Input
+	dst.Output += src.Output
+	dst.CacheWrite += src.CacheWrite
+	dst.CacheRead += src.CacheRead
+	dst.Total += src.Total
+}
+
+func mapFromAny(value any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	if v, ok := value.(map[string]any); ok {
+		return v
+	}
+	return nil
+}
+
+func tokenNumber(value any) float64 {
+	switch v := value.(type) {
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case json.Number:
+		n, _ := v.Float64()
+		return n
+	case string:
+		n, _ := strconv.ParseFloat(v, 64)
+		return n
+	default:
+		return 0
+	}
 }
 
 func trimRunes(value string, max int) string {

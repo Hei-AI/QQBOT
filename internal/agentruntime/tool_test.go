@@ -145,6 +145,30 @@ func TestNormalizeToolCallRemovesOSArguments(t *testing.T) {
 	}
 }
 
+func TestNormalizeToolCallRepairsTaggedArguments(t *testing.T) {
+	call := NormalizeToolCall(ToolCall{
+		ID:   "call-1",
+		Name: "novel_app",
+		Arguments: map[string]any{
+			"action": "upsert_entry",
+			"text</longcat_arg_key>\n\n**启**\n雨落下来了。\n<longcat_arg_value>\n<longcat_arg_key>projectId": "novel-novel-306100",
+			"title": "旧日记",
+		},
+	})
+	if call.Arguments["action"] != "upsert_entry" {
+		t.Fatalf("action should be preserved: %#v", call.Arguments)
+	}
+	if call.Arguments["title"] != "旧日记" {
+		t.Fatalf("title should be preserved: %#v", call.Arguments)
+	}
+	if call.Arguments["projectId"] != "novel-novel-306100" {
+		t.Fatalf("projectId should be repaired: %#v", call.Arguments)
+	}
+	if call.Arguments["text"] != "**启**\n雨落下来了。" {
+		t.Fatalf("text should be repaired: %#v", call.Arguments)
+	}
+}
+
 func TestToolCatalogObserverCanReplayPriorResult(t *testing.T) {
 	catalog := NewToolCatalog(toolWithoutOS{})
 	observer := &recordingToolObserver{prior: &ToolResult{Kind: "business", Content: `{"cached":true}`}}

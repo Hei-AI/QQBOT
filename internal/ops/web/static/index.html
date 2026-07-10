@@ -127,6 +127,49 @@
       .stat { border-left: 3px solid var(--accent); background: var(--panel); padding: 10px 12px; }
       .stat span { display: block; color: var(--muted); font-size: 12px; }
       .stat strong { display: block; margin-top: 2px; font-size: 20px; }
+      .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 12px; }
+      .status-card {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: linear-gradient(120deg, #fff 0%, #fff 70%, #f7fbff 100%);
+        padding: 14px 16px;
+      }
+      .status-card span { display: block; color: var(--muted); font-size: 12px; }
+      .status-card strong { display: block; margin-top: 4px; color: #111827; font-size: 18px; line-height: 1.2; }
+      .status-card.good strong { color: var(--good); }
+      .status-card.warn strong { color: var(--warn); }
+      .status-card.bad strong { color: var(--bad); }
+      .token-card {
+        margin-bottom: 12px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: linear-gradient(105deg, #fff 0%, #fff 64%, #fbfaf7 100%);
+        padding: 18px 20px;
+      }
+      .token-card-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        margin-bottom: 6px;
+      }
+      .token-card-title { color: #6d28d9; font-size: 13px; font-weight: 700; }
+      .token-card-date { width: 150px; }
+      .token-total { font-size: 32px; line-height: 1.1; font-weight: 800; color: #111827; }
+      .token-subtitle { margin-top: 5px; color: var(--muted); font-size: 13px; }
+      .token-bar {
+        display: flex;
+        height: 10px;
+        margin: 12px 0;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #eef2f6;
+      }
+      .token-segment { min-width: 2px; }
+      .token-legend { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 36px; }
+      .token-metric { display: flex; align-items: baseline; gap: 7px; color: var(--muted); font-size: 13px; }
+      .token-dot { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; }
+      .token-metric strong { color: var(--text); font: 12px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; }
       .table-wrap { overflow: auto; }
       table { width: 100%; border-collapse: collapse; min-width: 760px; }
       th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
@@ -169,7 +212,10 @@
         .brand { display: none; }
         .nav { display: flex; overflow-x: auto; }
         .nav button { width: auto; white-space: nowrap; }
-        .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .stats, .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .token-card-head { flex-direction: column; }
+        .token-card-date { width: 100%; }
+        .token-legend { grid-template-columns: 1fr; }
         .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
         header { position: static; padding: 10px 12px; }
         .content { padding: 12px; }
@@ -205,7 +251,8 @@
           <div class="notice" id="notice"></div>
 
           <section class="view active" id="view-overview">
-            <div class="stats" id="overview-stats"></div>
+            <div class="status-grid" id="overview-stats"></div>
+            <div id="overview-token-usage"></div>
             <div class="grid cols-2">
               <section class="panel">
                 <div class="panel-head"><h2>Agent Dashboard</h2><span class="subtle" id="dashboard-time"></span></div>
@@ -236,6 +283,7 @@
               <select id="llm-status"><option value="">全部状态</option><option value="success">success</option><option value="failed">failed</option></select>
               <button data-load="llm-calls">查询</button>
             </div>
+            <div id="llm-token-usage"></div>
             <div class="panel" id="llm-calls-result"></div>
           </section>
 
@@ -381,7 +429,7 @@
         runtime: ["运行管理", "调度、认证和 Agent 状态维护"],
         tools: ["操作台", "手动发送和 LLM 调试"]
       };
-      const state = { active: "overview", pages: {} };
+      const state = { active: "overview", pages: {}, tokenDate: "" };
 
       function esc(value) {
         return String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -395,6 +443,24 @@
       function clip(value, length = 120) {
         const text = typeof value === "string" ? value : json(value);
         return text.length > length ? text.slice(0, length) + "..." : text;
+      }
+      function num(value) {
+        return Number(value || 0).toLocaleString("zh-CN");
+      }
+      function todayInputValue() {
+        const date = new Date();
+        date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+        return date.toISOString().slice(0, 10);
+      }
+      function ensureDateInput(id) {
+        const input = $(id);
+        if (!state.tokenDate) state.tokenDate = todayInputValue();
+        if (input && !input.value) input.value = state.tokenDate;
+        if (input?.value) state.tokenDate = input.value;
+        return state.tokenDate;
+      }
+      function tokenUsageURL(date) {
+        return "/llm-token-usage/summary" + (date ? `?date=${encodeURIComponent(date)}` : "");
       }
       function badge(value) {
         const text = String(value ?? "");
@@ -428,7 +494,12 @@
       }
 
       async function loadOverview() {
-        const [dashboard, health] = await Promise.all([request("/agent-dashboard/current"), request("/health")]);
+        const tokenDate = ensureDateInput("overview-token-date") || todayInputValue();
+        const [dashboard, health, tokenUsage] = await Promise.all([
+          request("/agent-dashboard/current"),
+          request("/health"),
+          request(tokenUsageURL(tokenDate))
+        ]);
         $("dashboard").textContent = json(dashboard);
         $("health").textContent = json(health);
         $("dashboard-time").textContent = time(health.timestamp);
@@ -436,16 +507,21 @@
         const rootAgent = agents.find(agent => agent.id === "root") || {};
         const storyAgent = agents.find(agent => agent.id === "story") || {};
         const root = rootAgent.runtime ?? dashboard.root ?? dashboard.agent ?? dashboard;
+        const rootContext = rootAgent.context || {};
+        const lastLlm = rootAgent.activity?.lastLlmCall || {};
         const story = storyAgent.runtime ?? dashboard.story ?? dashboard.storyAgent ?? {};
         const rhythm = root.autonomous?.lastRhythmSignal?.kind || "-";
         const guard = root.toolGuard?.lastEvent?.rule || "-";
         $("overview-stats").innerHTML = [
-          ["Health", health.status ?? "unknown"],
-          ["Root State", root.loopState ?? root.state ?? "unknown"],
-          ["Rhythm", rhythm],
-          ["ToolGuard", guard],
-          ["Story State", story.loopState ?? story.state ?? "unknown"]
-        ].map(([label, value]) => `<div class="stat"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("");
+          ["Health", health.status ?? "unknown", health.status === "ok" ? "good" : "bad"],
+          ["Root State", root.loopState ?? root.state ?? "unknown", (root.loopState ?? root.state) === "idle" ? "good" : "warn"],
+          ["Context", num(rootContext.rootMessageCount), ""],
+          ["Prompt Tokens", num(lastLlm.promptTokens || lastLlm.totalTokens || 0), ""],
+          ["Rhythm", rhythm, rhythm === "-" ? "" : "warn"],
+          ["ToolGuard", guard, guard === "-" ? "good" : "warn"],
+          ["Story State", story.loopState ?? story.state ?? "unknown", (story.loopState ?? story.state) === "idle" ? "good" : "warn"]
+        ].map(([label, value, tone]) => `<div class="status-card ${esc(tone)}"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("");
+        renderTokenUsageCard("overview-token-usage", tokenUsage, { title: "今天", dateInputId: "overview-token-date" });
       }
       async function loadMessages() {
         const data = await request("/napcat-group-message/query?" + params({ messageType: $("messages-type").value, groupId: $("messages-group").value, userId: $("messages-user").value, keyword: $("messages-keyword").value }));
@@ -455,11 +531,62 @@
         ]), data.pagination);
       }
       async function loadLlmCalls() {
-        const data = await request("/llm-chat-call/query?" + params({ provider: $("llm-provider").value, model: $("llm-model").value, status: $("llm-status").value }));
+        const tokenDate = ensureDateInput("llm-token-date");
+        const [usage, data] = await Promise.all([
+          request(tokenUsageURL(tokenDate)),
+          request("/llm-chat-call/query?" + params({ provider: $("llm-provider").value, model: $("llm-model").value, status: $("llm-status").value }))
+        ]);
+        renderTokenUsage(usage, tokenDate);
         table("llm-calls-result", ["时间", "状态", "Provider", "Model", "耗时", "错误", "详情"], data.items.map(x => [
           esc(time(x.createdAt)), badge(x.status), esc(x.provider), esc(x.model), esc(x.latencyMs == null ? "" : `${x.latencyMs} ms`),
           `<div class="clip">${esc(clip(x.error?.message || "", 120))}</div>`, details(x)
         ]), data.pagination);
+      }
+      function renderTokenUsage(data, tokenDate) {
+        $("llm-token-usage").innerHTML = `
+          ${tokenUsageCardHTML(data, { title: tokenDate === todayInputValue() ? "今天" : "日期", dateInputId: "llm-token-date" })}
+        `;
+      }
+      function renderTokenUsageCard(target, data, options = {}) {
+        $(target).innerHTML = tokenUsageCardHTML(data, options);
+      }
+      function tokenUsageCardHTML(data, options = {}) {
+        const total = data.total || {};
+        const values = [
+          ["输入", total.input, "#3b82f6"],
+          ["输出", total.output, "#10b981"],
+          ["缓存写", total.cacheWrite, "#f97316"],
+          ["缓存读", total.cacheRead, "#06b6d4"]
+        ];
+        const barValues = values.filter(([label]) => label !== "输入");
+        const visibleTotal = values.reduce((sum, item) => sum + Number(item[1] || 0), 0);
+        const barTotal = barValues.reduce((sum, item) => sum + Number(item[1] || 0), 0);
+        const promptTokens = Number(total.input || 0);
+        const nonCache = Math.max(promptTokens - Number(total.cacheRead || 0), 0) + Number(total.output || 0) + Number(total.cacheWrite || 0);
+        const hitRate = promptTokens > 0 ? Math.round(Number(total.cacheRead || 0) / promptTokens * 100) : 0;
+        const dateInput = options.dateInputId ? ($(options.dateInputId)?.value || state.tokenDate || todayInputValue()) : "";
+        const title = options.title || "Token Usage";
+        const dateText = dateInput ? dateInput.slice(5) : "";
+        const segments = barValues.map(([label, value, color]) => {
+          const width = barTotal > 0 ? Math.max(Number(value || 0) / barTotal * 100, value ? 1 : 0) : 0;
+          return `<span class="token-segment" title="${esc(label)} ${num(value)}" style="width:${width}%;background:${color}"></span>`;
+        }).join("");
+        const legend = values.map(([label, value, color]) => `
+          <div class="token-metric"><span class="token-dot" style="background:${color}"></span><span>${esc(label)}</span><strong>${num(value)}</strong></div>
+        `).join("");
+        return `
+          <section class="token-card">
+            <div class="token-card-head">
+              <div>
+                <div class="token-card-title">${esc(title)}${dateText ? " · " + esc(dateText) : ""}</div>
+                <div class="token-total">${num(visibleTotal)}</div>
+                <div class="token-subtitle">${num(total.calls)} 次请求 · 非缓存 ${num(nonCache)} · 缓存命中 ${hitRate}%</div>
+              </div>
+              ${options.dateInputId ? `<input class="token-card-date" id="${esc(options.dateInputId)}" type="date" value="${esc(dateInput || todayInputValue())}" />` : ""}
+            </div>
+            <div class="token-bar">${segments}</div>
+            <div class="token-legend">${legend}</div>
+          </section>`;
       }
       async function loadLogs() {
         const data = await request("/app-log/query?" + params({ level: $("logs-level").value, message: $("logs-message").value }));
@@ -589,6 +716,12 @@
         if (button) activate(button.dataset.view);
       });
       $("refresh").addEventListener("click", () => load());
+      document.addEventListener("change", event => {
+        const input = event.target.closest("input[type='date']");
+        if (!input || (input.id !== "overview-token-date" && input.id !== "llm-token-date")) return;
+        state.tokenDate = input.value || todayInputValue();
+        load();
+      });
       document.querySelectorAll("[data-load]").forEach(button => button.addEventListener("click", () => load(button.dataset.load)));
       $("refresh-metric-list").addEventListener("click", loadMetricList);
       $("refresh-scheduler").addEventListener("click", () => loadScheduler().catch(error => notice(error.message, true)));

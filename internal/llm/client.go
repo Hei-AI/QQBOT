@@ -109,15 +109,24 @@ func (c *LLMClient) PlaygroundTools() map[string]any {
 }
 
 func (c *LLMClient) ChatDirect(ctx context.Context, req LLMChatRequest) (map[string]any, int, error) {
+	return c.chatDirectUsage(ctx, "", req)
+}
+
+func (c *LLMClient) chatDirectUsage(ctx context.Context, usage string, req LLMChatRequest) (map[string]any, int, error) {
 	start := time.Now()
 	requestID := common.NewID()
 	provider := req.Provider
 	model := req.Model
 	nativeReq, response, nativeResp, err := c.callProvider(ctx, req)
 	latency := int(time.Since(start).Milliseconds())
+	extension := map[string]any{}
+	if usage != "" {
+		extension["usage"] = usage
+	}
 	if err != nil {
 		c.store.AddLlmCall(db.LlmCallItem{
 			RequestID: requestID, Seq: 1, Provider: provider, Model: model, Status: "failed", LatencyMs: &latency,
+			Extension:      extension,
 			RequestPayload: common.JSONMap(req), NativeRequestPayload: nativeReq, NativeResponsePayload: nativeResp,
 			Error: map[string]any{"name": "LLMError", "message": err.Error()},
 		})
@@ -125,6 +134,7 @@ func (c *LLMClient) ChatDirect(ctx context.Context, req LLMChatRequest) (map[str
 	}
 	c.store.AddLlmCall(db.LlmCallItem{
 		RequestID: requestID, Seq: 1, Provider: provider, Model: model, Status: "success", LatencyMs: &latency,
+		Extension:      extension,
 		RequestPayload: common.JSONMap(req), ResponsePayload: response, NativeRequestPayload: nativeReq, NativeResponsePayload: nativeResp,
 	})
 	response["nativeRequestPayload"] = nativeReq
@@ -152,7 +162,7 @@ func (c *LLMClient) ChatUsage(ctx context.Context, usage string, req LLMChatRequ
 				c.store.Log("warn", "LLM thinking history repaired", map[string]any{"event": "llm.history.repaired", "provider": req.Provider, "model": req.Model, "before": originalMessageCount, "after": len(req.Messages)})
 			}
 			c.store.Log("info", "LLM usage attempt", map[string]any{"event": "llm.usage.attempt", "usage": usage, "provider": req.Provider, "model": req.Model, "attempt": i + 1, "messages": len(req.Messages), "tools": len(req.Tools)})
-			resp, _, err := c.ChatDirect(ctx, req)
+			resp, _, err := c.chatDirectUsage(ctx, usage, req)
 			if err == nil {
 				message, _ := resp["message"].(map[string]any)
 				c.store.Log("info", "LLM usage response", map[string]any{"event": "llm.usage.response", "usage": usage, "provider": req.Provider, "model": req.Model, "content": trimLog(common.AsString(message["content"]), 500), "hasReasoningContent": strings.TrimSpace(common.AsString(message["reasoningContent"])) != "", "toolCalls": message["toolCalls"]})
@@ -399,11 +409,25 @@ func (c *LLMClient) chatVisionUsage(ctx context.Context, req LLMChatRequest) (ma
 			attempted = true
 			req.Provider = attempt.Provider
 			req.Model = attempt.Model
+			req.MaxTokens = attempt.MaxTokens
 			c.store.Log("info", "LLM usage attempt", map[string]any{"event": "llm.usage.attempt", "usage": "vision", "provider": req.Provider, "model": req.Model, "attempt": i + 1, "messages": len(req.Messages), "tools": len(req.Tools)})
-			resp, _, err := c.ChatDirect(ctx, req)
+			var resp map[string]any
+			var err error
+			if req.Provider == "longcat" {
+				resp, err = c.callLongCatAnthropicVision(ctx, req)
+			} else {
+				resp, _, err = c.chatDirectUsage(ctx, "vision", req)
+			}
 			if err == nil {
 				message, _ := resp["message"].(map[string]any)
-				c.store.Log("info", "LLM usage response", map[string]any{"event": "llm.usage.response", "usage": "vision", "provider": req.Provider, "model": req.Model, "content": trimLog(common.AsString(message["content"]), 500), "hasReasoningContent": strings.TrimSpace(common.AsString(message["reasoningContent"])) != "", "toolCalls": message["toolCalls"]})
+				content := common.AsString(message["content"])
+				if isVisionNoImageResponse(content) {
+					err = fmt.Errorf("vision model did not recognize the attached image")
+					c.store.Log("warn", "Vision LLM response rejected", map[string]any{"event": "llm.vision.rejected", "usage": "vision", "provider": req.Provider, "model": req.Model, "content": trimLog(content, 500), "reason": "no_image_seen"})
+					last = err
+					continue
+				}
+				c.store.Log("info", "LLM usage response", map[string]any{"event": "llm.usage.response", "usage": "vision", "provider": req.Provider, "model": req.Model, "content": trimLog(content, 500), "hasReasoningContent": strings.TrimSpace(common.AsString(message["reasoningContent"])) != "", "toolCalls": message["toolCalls"]})
 				return resp, nil
 			}
 			c.store.Log("error", "LLM usage attempt failed", map[string]any{"event": "llm.usage.failed", "usage": "vision", "provider": req.Provider, "model": req.Model, "error": err.Error()})
@@ -419,6 +443,36 @@ func (c *LLMClient) chatVisionUsage(ctx context.Context, req LLMChatRequest) (ma
 	return nil, errors.New("no LLM attempts configured")
 }
 
+func isVisionNoImageResponse(content string) bool {
+	text := strings.ToLower(strings.TrimSpace(content))
+	if text == "" {
+		return true
+	}
+	noImagePhrases := []string{
+		"没有看到",
+		"没有检测到",
+		"没有在输入中检测到",
+		"没看到",
+		"看不到",
+		"无法看到",
+		"无法查看",
+		"可供描述的图片内容",
+		"请直接发送需要描述的图片",
+		"重新发送图片",
+		"no image",
+		"can't see the image",
+		"cannot see the image",
+		"unable to see the image",
+		"image was not provided",
+	}
+	for _, phrase := range noImagePhrases {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
 func visionAttemptSupportsImages(provider, model string) bool {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	model = strings.ToLower(strings.TrimSpace(model))
@@ -429,6 +483,8 @@ func visionAttemptSupportsImages(provider, model string) bool {
 		return strings.Contains(model, "gpt-4o") || strings.Contains(model, "gpt-4.1") || strings.Contains(model, "gpt-5") || strings.Contains(model, "o3") || strings.Contains(model, "o4")
 	case "openai-codex", "claude-code":
 		return true
+	case "longcat":
+		return strings.HasPrefix(model, "longcat-")
 	case "google":
 		return strings.HasPrefix(model, "gemini-")
 	default:
@@ -594,6 +650,82 @@ func (c *LLMClient) callClaudeCode(ctx context.Context, req LLMChatRequest, conf
 	return nativeReq, response, nativeResp, nil
 }
 
+func (c *LLMClient) callLongCatAnthropicVision(ctx context.Context, req LLMChatRequest) (map[string]any, error) {
+	conf := c.providerConfig("longcat")
+	if req.Model == "" || !contains(conf.Models, req.Model) {
+		return nil, fmt.Errorf("所选 LLM 模型未在当前 provider 中配置")
+	}
+	if strings.TrimSpace(conf.APIKey) == "" {
+		return nil, fmt.Errorf("provider apiKey is empty")
+	}
+	if strings.TrimSpace(conf.BaseURL) == "" {
+		return nil, fmt.Errorf("provider baseUrl is empty")
+	}
+	payload := toLongCatAnthropicVisionRequestBody(req)
+	nativeReq := common.JSONMap(payload)
+	start := time.Now()
+	requestID := common.NewID()
+	body, _ := json.Marshal(payload)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, longCatAnthropicMessagesURL(conf.BaseURL), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+conf.APIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Anthropic-Version", "2023-06-01")
+	res, err := c.http.Do(httpReq)
+	if err != nil {
+		c.addDirectLlmCall(requestID, start, "vision", req, nativeReq, nil, nil, err)
+		return nil, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 16<<20))
+	nativeResp := parseJSONMap(string(raw))
+	if nativeResp == nil {
+		nativeResp = map[string]any{"status": res.StatusCode, "body": string(raw)}
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		err := fmt.Errorf("LLM 上游服务调用失败: %s%s", res.Status, upstreamErrorSuffix(nativeResp))
+		c.addDirectLlmCall(requestID, start, "vision", req, nativeReq, nil, nativeResp, err)
+		return nil, err
+	}
+	response, err := fromClaudeMessageResponse(nativeResp, req.Model)
+	if err != nil {
+		c.addDirectLlmCall(requestID, start, "vision", req, nativeReq, nil, nativeResp, err)
+		return nil, err
+	}
+	response["provider"] = "longcat"
+	response["nativeRequestPayload"] = nativeReq
+	c.addDirectLlmCall(requestID, start, "vision", req, nativeReq, response, nativeResp, nil)
+	return response, nil
+}
+
+func (c *LLMClient) addDirectLlmCall(requestID string, start time.Time, usage string, req LLMChatRequest, nativeReq map[string]any, response map[string]any, nativeResp map[string]any, callErr error) {
+	if c.store == nil {
+		return
+	}
+	latency := int(time.Since(start).Milliseconds())
+	status := "success"
+	item := db.LlmCallItem{
+		RequestID:             requestID,
+		Seq:                   1,
+		Provider:              req.Provider,
+		Model:                 req.Model,
+		Extension:             map[string]any{"usage": usage},
+		Status:                status,
+		LatencyMs:             &latency,
+		RequestPayload:        common.JSONMap(req),
+		ResponsePayload:       response,
+		NativeRequestPayload:  nativeReq,
+		NativeResponsePayload: nativeResp,
+	}
+	if callErr != nil {
+		item.Status = "failed"
+		item.Error = map[string]any{"name": "LLMError", "message": callErr.Error()}
+	}
+	c.store.AddLlmCall(item)
+}
+
 func (c *LLMClient) providerConfig(id string) config.LLMProviderConfig {
 	switch id {
 	case "deepseek":
@@ -638,6 +770,24 @@ func chatCompletionsURL(provider, baseURL string) string {
 		return url + "/v1/chat/completions"
 	}
 	return url + "/chat/completions"
+}
+
+func longCatAnthropicMessagesURL(baseURL string) string {
+	url := strings.TrimRight(baseURL, "/")
+	url = strings.TrimSuffix(url, "/chat/completions")
+	if strings.HasSuffix(url, "/messages") {
+		return url
+	}
+	if idx := strings.Index(url, "/openai"); idx >= 0 {
+		return url[:idx] + "/anthropic/v1/messages"
+	}
+	if strings.HasSuffix(url, "/anthropic/v1") {
+		return url + "/messages"
+	}
+	if strings.HasSuffix(url, "/anthropic") {
+		return url + "/v1/messages"
+	}
+	return url + "/anthropic/v1/messages"
 }
 
 func valueOrString(value, fallback string) string {
@@ -892,6 +1042,29 @@ func toClaudeCodeRequestBody(req LLMChatRequest) map[string]any {
 		payload["context_management"] = map[string]any{"edits": []map[string]any{{"type": "clear_thinking_20251015", "keep": "all"}}}
 	} else if strings.HasPrefix(req.Model, "claude-sonnet-4-") || strings.HasPrefix(req.Model, "claude-opus-4-") {
 		payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": 1024}
+	}
+	return payload
+}
+
+func toLongCatAnthropicVisionRequestBody(req LLMChatRequest) map[string]any {
+	messages := []map[string]any{}
+	for _, m := range req.Messages {
+		if m.Role != "user" && m.Role != "assistant" {
+			continue
+		}
+		messages = append(messages, map[string]any{"role": m.Role, "content": claudeUserContent(m.Content)})
+	}
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+	payload := map[string]any{
+		"model":      req.Model,
+		"max_tokens": maxTokens,
+		"messages":   messages,
+	}
+	if strings.TrimSpace(req.System) != "" {
+		payload["system"] = req.System
 	}
 	return payload
 }

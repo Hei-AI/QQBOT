@@ -39,6 +39,105 @@ func TestStringPtrPreservesIntegerTrailingZero(t *testing.T) {
 	}
 }
 
+func TestSearchNapcatMessagesRestrictsTimeAndScope(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	groupID, userID, nickname := "10001", "20002", "小镜"
+	store.AddNapcatMessage(NapcatMessageItem{
+		MessageType: "group", GroupID: &groupID, UserID: &userID, Nickname: &nickname,
+		RawMessage: "山手线还在挖", CreatedAt: time.Now().Add(-time.Hour),
+	})
+	store.AddNapcatMessage(NapcatMessageItem{
+		MessageType: "group", GroupID: &groupID, UserID: &userID, Nickname: &nickname,
+		RawMessage: "过期消息", CreatedAt: time.Now().AddDate(0, 0, -8),
+	})
+
+	items := store.SearchNapcatMessages(ChatHistoryQuery{Query: "山手线", Days: 7, Limit: 10})
+	if len(items) != 1 || items[0].RawMessage != "山手线还在挖" {
+		t.Fatalf("unexpected keyword search: %#v", items)
+	}
+	items = store.SearchNapcatMessages(ChatHistoryQuery{MessageType: "group", TargetID: groupID, Days: 7, Limit: 10})
+	if len(items) != 1 || items[0].RawMessage != "山手线还在挖" {
+		t.Fatalf("unexpected scoped search: %#v", items)
+	}
+	if items = store.SearchNapcatMessages(ChatHistoryQuery{Days: 7}); items != nil {
+		t.Fatalf("unscoped empty-query search should be rejected: %#v", items)
+	}
+}
+
+func TestLLMTokenUsageSummaryUsesStructuredTable(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "store.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	store.AddLlmCall(LlmCallItem{
+		RequestID: "req-1",
+		Seq:       1,
+		Provider:  "longcat",
+		Model:     "LongCat-2.0",
+		Extension: map[string]any{"usage": "agent"},
+		Status:    "success",
+		CreatedAt: time.Date(2026, 7, 3, 12, 0, 0, 0, time.Local),
+		ResponsePayload: map[string]any{"usage": map[string]any{
+			"promptTokens":     120159,
+			"completionTokens": 180,
+			"totalTokens":      120339,
+			"cacheHitTokens":   119936,
+			"cacheMissTokens":  223,
+		}},
+	})
+	store.AddLlmCall(LlmCallItem{
+		RequestID: "req-2",
+		Seq:       1,
+		Provider:  "longcat",
+		Model:     "LongCat-2.0",
+		Extension: map[string]any{"usage": "agent"},
+		Status:    "success",
+		CreatedAt: time.Date(2026, 7, 2, 12, 0, 0, 0, time.Local),
+		ResponsePayload: map[string]any{"usage": map[string]any{
+			"promptTokens":     1,
+			"completionTokens": 1,
+			"totalTokens":      2,
+		}},
+	})
+	store.AddLlmCall(LlmCallItem{
+		RequestID: "req-3",
+		Seq:       1,
+		Provider:  "longcat",
+		Model:     "LongCat-2.0",
+		Status:    "success",
+		CreatedAt: time.Date(2026, 7, 3, 13, 0, 0, 0, time.Local),
+		ResponsePayload: map[string]any{"usage": map[string]any{
+			"promptTokens":     2,
+			"completionTokens": 3,
+			"totalTokens":      5,
+		}},
+	})
+
+	summary := store.LLMTokenUsageSummary(nil, nil)
+	if summary.Total.Calls != 3 {
+		t.Fatalf("expected three calls, got %#v", summary.Total)
+	}
+	start := time.Date(2026, 7, 3, 0, 0, 0, 0, time.Local)
+	end := start.AddDate(0, 0, 1)
+	summary = store.LLMTokenUsageSummary(&start, &end)
+	if summary.Total.Calls != 2 {
+		t.Fatalf("expected two calls in one daily row, got %#v", summary.Total)
+	}
+	if summary.Total.Input != 120161 || summary.Total.Output != 183 || summary.Total.CacheRead != 119936 || summary.Total.CacheWrite != 223 || summary.Total.Total != 120344 {
+		t.Fatalf("unexpected token summary: %#v", summary.Total)
+	}
+	if len(summary.Recent) != 1 || summary.Recent[0].Date != "2026-07-03" || summary.Recent[0].Calls != 2 {
+		t.Fatalf("unexpected recent rows: %#v", summary.Recent)
+	}
+}
+
 func TestNewsFeedCursorListsNewArticlesAndAdvances(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "store.json"))
 	if err != nil {
